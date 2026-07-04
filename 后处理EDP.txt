@@ -1,0 +1,270 @@
+# -*- coding: utf-8 -*-
+"""
+OpenSees 月震分析 - 5个EDP后处理 (最终版，严格对应论文定义)
+============================================================
+修正记录 (基于审稿意见)：
+1. RVH 改为 竖向峰值 / 水平向合成峰值 (sqrt(ux²+uy²))
+2. 增加 ACCEL_IN_G 开关，自动转换 g → m/s²
+3. Dw,peak 持时窗口基于绝对输入功率 |a_g·v| 的累积值 (5%~95%)
+4. 增加数据一致性断言
+5. 输出 CSV 汇总 + 峰值时刻
+6. 自动遍历 outputs_mesh_* 文件夹
+============================================================
+"""
+
+import os
+import sys
+import glob
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# 0. 用户全局配置 (仅需修改这里)
+# ============================================================
+ACCEL_IN_G = True          # True: 地震波文件单位为 g (需×9.81) ; False: 已为 m/s²
+G_CONST = 9.81             # 地球重力加速度 (月球地震记录通常以g为单位)
+EPS = 1.0e-12             # 防除零
+
+# 结构质量 (从Tcl代码中提取，保持一致)
+# m = rho * A * L = 2700 * (pi*(0.35/2)^2 - pi*((0.35-2*0.035)/2)^2) * 4.5
+D = 0.35
+t_wall = 0.035
+L = 4.5
+rho = 2700.0
+A = np.pi * ((D/2)**2 - (D/2 - t_wall)**2)
+MASS = rho * A * L
+print(f"✅ 结构总质量 (自动计算): M = {MASS:.4f} kg\n")
+
+# 地震波文件名 (与OpenSees脚本一致)
+FILES_ACCEL = {
+    'X': "MH1.txt",
+    'Y': "MH2.txt",
+    'Z': "combine.txt"
+}
+
+# ============================================================
+# 1. 核心读取函数 (带错误检查)
+# ============================================================
+def read_opensees_out(filepath, cols=(0,1,2,3)):
+    """读取OpenSees输出文件，默认取 时间, ux, uy, uz"""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+    data = np.loadtxt(filepath)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    return data[:, list(cols)]
+
+def read_accel_file(filepath, dt_ref=0.01):
+    """读取加速度文件，支持单列(加速度)或双列(时间,加速度)"""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"地震文件不存在: {filepath}")
+    data = np.loadtxt(filepath)
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    
+    if data.shape[1] == 1:
+        n = data.shape[0]
+        t = np.arange(n) * dt_ref
+        accel = data[:, 0]
+    else:
+        t = data[:, 0]
+        accel = data[:, 1]
+    
+    # 单位转换
+    if ACCEL_IN_G:
+        accel = accel * G_CONST  # g → m/s²
+    
+    return t, accel
+
+# ============================================================
+# 2. 单个文件夹的EDP计算 (严格按论文公式)
+# ============================================================
+def compute_edps_for_folder(folder_path):
+    """计算单个 output 文件夹的 5 个 EDP (严格按论文定义)"""
+    
+    # ---- 读取位移 & 速度 ----
+    disp_path = os.path.join(folder_path, "disp_all.out")
+    vel_path  = os.path.join(folder_path, "vel_all.out")
+    
+    disp = read_opensees_out(disp_path, cols=(0,1,2,3))
+    vel  = read_opensees_out(vel_path, cols=(0,1,2,3))
+    
+    t = disp[:, 0]
+    ux, uy, uz = disp[:, 1], disp[:, 2], disp[:, 3]
+    vx, vy, vz = vel[:, 1], vel[:, 2], vel[:, 3]
+    
+    # ---- 数据完整性检查 (防止时间轴不匹配) ----
+    dt = np.mean(np.diff(t))
+    assert len(t) == len(vx), "位移与速度时间轴长度不一致！"
+    print(f"   读取: {len(t)} 步, dt = {dt:.6f} s")
+
+    # ---- 读取三向地震波并插值对齐 ----
+    t_x, ag_x = read_accel_file(FILES_ACCEL['X'], dt)
+    t_y, ag_y = read_accel_file(FILES_ACCEL['Y'], dt)
+    t_z, ag_z = read_accel_file(FILES_ACCEL['Z'], dt)
+    
+    ag_x = np.interp(t, t_x, ag_x)
+    ag_y = np.interp(t, t_y, ag_y)
+    ag_z = np.interp(t, t_z, ag_z)
+    
+    # ---- 计算合成位移 ----
+    disp_3d = np.sqrt(ux**2 + uy**2 + uz**2)      # 三维合成
+    disp_h  = np.sqrt(ux**2 + uy**2)              # 水平合成 (用于RVH)
+    
+    # =========================================================
+    # EDP 1: D_cum,3D (三维累积位移)
+    # =========================================================
+    D_cum_3D = np.trapz(disp_3d, t)
+    
+    # =========================================================
+    # EDP 2: E_in (输入能量) - 注意加速度已转 m/s²
+    # =========================================================
+    power_sum = ag_x * vx + ag_y * vy + ag_z * vz
+    E_in = -MASS * np.trapz(power_sum, t)
+    
+    # =========================================================
+    # EDP 3: D_w,peak (持时加权峰值位移)
+    # 修正：严格按论文定义 w(t)=|a_g(t)·v(t)| (绝对输入功率)
+    # 累积权重确定 5%~95% 持时窗口，窗口内取最大三维位移
+    # =========================================================
+    abs_power = (np.abs(ag_x * vx) + 
+                 np.abs(ag_y * vy) + 
+                 np.abs(ag_z * vz))
+    cum_weight = np.cumsum(abs_power * dt)
+    cum_weight_norm = cum_weight / cum_weight[-1]
+    
+    idx_5 = np.searchsorted(cum_weight_norm, 0.05)
+    idx_95 = np.searchsorted(cum_weight_norm, 0.95)
+    # 防越界 (极少发生，但保证稳健)
+    if idx_5 == idx_95:
+        idx_5, idx_95 = 0, len(t) - 1
+    
+    D_w_peak = np.max(disp_3d[idx_5:idx_95])
+    t5, t95 = t[idx_5], t[idx_95]
+    
+    # =========================================================
+    # EDP 4: D_3D,max (三维峰值位移)
+    # =========================================================
+    D_3D_max = np.max(disp_3d)
+    idx_max_3d = np.argmax(disp_3d)
+    t_max_3d = t[idx_max_3d]
+    
+    # =========================================================
+    # EDP 5: R_VH (竖向与水平向位移比) 
+    # 分母为水平合成位移 sqrt(ux²+uy²)
+    # =========================================================
+    max_uz = np.max(np.abs(uz))
+    max_h  = np.max(disp_h)
+    R_VH = max_uz / (max_h + EPS)
+    idx_max_uz = np.argmax(np.abs(uz))
+    t_max_uz = t[idx_max_uz]
+    
+    # ---- 返回结果 ----
+    return {
+        "Folder": os.path.basename(folder_path),
+        "D_cum_3D (m)": D_cum_3D,
+        "E_in (J)": E_in,
+        "D_w_peak (m)": D_w_peak,
+        "D_3D_max (m)": D_3D_max,
+        "R_VH (-)": R_VH,
+        # 辅助信息 (用于论文描述)
+        "t5 (s)": t5,
+        "t95 (s)": t95,
+        "t@D3Dmax (s)": t_max_3d,
+        "t@maxUz (s)": t_max_uz,
+        "max|Uz| (m)": max_uz,
+        "max|Uh| (m)": max_h,
+        "质量 (kg)": MASS,
+        "步长 dt (s)": dt,
+    }
+
+# ============================================================
+# 3. 批量主程序 (自动遍历所有网格文件夹)
+# ============================================================
+if __name__ == "__main__":
+    
+    print("=" * 60)
+    print("开始批量 EDP 计算 (自动识别 outputs_mesh_* 文件夹)")
+    print(f"加速度单位转换 (g→m/s²): {'是' if ACCEL_IN_G else '否'}")
+    print("持时窗口定义: 基于绝对输入功率 |a_g·v| 的累积值 5%~95%")
+    print("=" * 60)
+    
+    # 查找所有 outputs_mesh_* 文件夹，并按数字排序
+    folders = glob.glob("outputs_mesh_*")
+    if not folders:
+        print("❌ 错误: 未找到任何 outputs_mesh_* 文件夹！")
+        sys.exit(1)
+    
+    # 按数字排序 (例如 outputs_mesh_1, outputs_mesh_2, ...)
+    def extract_number(f):
+        try:
+            return int(f.split('_')[-1])
+        except:
+            return 0
+    folders = sorted(folders, key=extract_number)
+    
+    print(f"发现 {len(folders)} 个网格文件夹:\n  " + "\n  ".join(folders) + "\n")
+    
+    all_results = []
+    for f in folders:
+        print(f"▶ 正在处理: {f}")
+        try:
+            res = compute_edps_for_folder(f)
+            all_results.append(res)
+            print(f"   ✅ 完成 (D_3D_max = {res['D_3D_max (m)']:.6e} m)\n")
+        except Exception as e:
+            print(f"   ❌ 报错: {e}\n")
+            continue
+    
+    if not all_results:
+        print("❌ 没有任何有效结果，请检查文件格式。")
+        sys.exit(1)
+    
+    # ---- 生成汇总 DataFrame ----
+    df = pd.DataFrame(all_results)
+    
+    # 提取核心5列用于论文表格
+    core_cols = ["Folder", "D_cum_3D (m)", "E_in (J)", "D_w_peak (m)", 
+                 "D_3D_max (m)", "R_VH (-)"]
+    df_core = df[core_cols].copy()
+    
+    # ---- 打印结果表格 (终端) ----
+    print("\n" + "=" * 80)
+    print("📊 EDP 汇总表 (Mesh Convergence)")
+    print("=" * 80)
+    print(df_core.to_string(index=False, float_format=lambda x: f"{x:.6e}"))
+    print("=" * 80)
+    
+    # ---- 保存 CSV (通用格式) ----
+    csv_path = "EDP_summary_all_mesh.csv"
+    df.to_csv(csv_path, index=False, float_format="%.6e")
+    print(f"\n✅ 详细结果已保存至: {csv_path}")
+    
+    # ---- 保存简洁文本表 (快速查看) ----
+    txt_path = "EDP_summary_table.txt"
+    with open(txt_path, "w") as f:
+        f.write("Mesh Convergence - EDP Summary\n")
+        f.write("=" * 80 + "\n")
+        f.write(df_core.to_string(index=False, float_format=lambda x: f"{x:.6e}"))
+        f.write("\n" + "=" * 80 + "\n")
+        f.write(f"质量 M = {MASS:.4f} kg (用于 E_in 计算)\n")
+        f.write(f"加速度单位转换 (g→m/s²): {'是' if ACCEL_IN_G else '否'}\n")
+        f.write("持时窗口定义: 基于绝对输入功率 |a_g·v| 的累积值 5%~95% 区间\n")
+    print(f"✅ 纯文本表格已保存至: {txt_path}")
+    
+    # ---- 额外输出用于论文 "Table of EDPs" 的LaTeX格式 (可选) ----
+    latex_path = "EDP_table_latex.txt"
+    with open(latex_path, "w") as f:
+        f.write("\\begin{table}[htbp]\n\\centering\n")
+        f.write("\\caption{EDP results for different mesh densities}\n")
+        f.write("\\begin{tabular}{c c c c c c}\n")
+        f.write("\\hline\n")
+        f.write("Mesh & $D_{cum,3D}$ (m) & $E_{in}$ (J) & $D_{w,peak}$ (m) & $D_{3D,max}$ (m) & $R_{VH}$ \\\\\n")
+        f.write("\\hline\n")
+        for _, row in df_core.iterrows():
+            f.write(f"{row['Folder']} & {row['D_cum_3D (m)']:.4e} & {row['E_in (J)']:.4e} & ")
+            f.write(f"{row['D_w_peak (m)']:.4e} & {row['D_3D_max (m)']:.4e} & {row['R_VH (-)']:.4f} \\\\\n")
+        f.write("\\hline\n\\end{tabular}\n\\end{table}\n")
+    print(f"✅ LaTeX 表格已保存至: {latex_path}")
+    
+    print("\n🎉 全部完成！请检查生成的 EDP_summary_all_mesh.csv 绘制收敛曲线。")
