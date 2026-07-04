@@ -1,37 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees 月震分析 - 5个EDP后处理 (单文件夹版)
-================================================
-用途：处理单个 outputs_mesh_* 文件夹，计算论文定义的5个EDP
-输入：
-  - 目标文件夹（如 outputs_mesh_10）需包含 disp_all.out, vel_all.out
-  - 同目录下需有地震波文件 MH1.txt, MH2.txt, combine.txt
-输出：
-  - 终端打印结果
-  - EDP_single_result.csv
-  - EDP_single_result.txt
-
-注意：加速度文件默认单位为 g，脚本自动转换为 m/s²（可关闭）
-================================================
+OpenSees 月震 EDP 后处理 (最终健壮版)
+自动定位 outputs_* 文件夹，支持多选，严格符合论文定义。
 """
 
 import os
 import sys
+import glob
 import numpy as np
 import pandas as pd
 
 # ============================================================
-# 0. 用户配置（修改前请确认）
+# 用户可调参数
 # ============================================================
-# 目标文件夹名称（即 OpenSees 输出目录）
-TARGET_FOLDER = "outputs_mesh_10"   # ← 改成你实际的文件夹名
+ACCEL_IN_G = True          # True: 地震波文件单位为 g (自动×9.81)
+G_CONST = 9.81
+EPS = 1.0e-12
 
-# 加速度单位转换开关
-ACCEL_IN_G = True          # True: 地震波文件单位为 g (自动×9.81) ; False: 已为 m/s²
-G_CONST = 9.81             # 地球重力加速度
-
-# 结构质量（必须与 Tcl 代码中 m 一致）
-# 自动根据几何参数计算，与 Tcl 中公式相同
+# 结构质量（与 Tcl 中完全一致）
 D = 0.35
 t_wall = 0.035
 L = 4.5
@@ -46,13 +32,10 @@ FILES_ACCEL = {
     'Z': "combine.txt"
 }
 
-EPS = 1.0e-12   # 防除零
-
 # ============================================================
-# 1. 读取函数
+# 读取函数
 # ============================================================
 def read_opensees_out(filepath, cols=(0,1,2,3)):
-    """读取 OpenSees 输出文件，默认取 时间, ux, uy, uz"""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"文件不存在: {filepath}")
     data = np.loadtxt(filepath)
@@ -61,13 +44,11 @@ def read_opensees_out(filepath, cols=(0,1,2,3)):
     return data[:, list(cols)]
 
 def read_accel_file(filepath, dt_ref=0.01):
-    """读取加速度文件，支持单列(加速度)或双列(时间,加速度)"""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"地震文件不存在: {filepath}")
     data = np.loadtxt(filepath)
     if data.ndim == 1:
         data = data.reshape(-1, 1)
-    
     if data.shape[1] == 1:
         n = data.shape[0]
         t = np.arange(n) * dt_ref
@@ -75,18 +56,14 @@ def read_accel_file(filepath, dt_ref=0.01):
     else:
         t = data[:, 0]
         accel = data[:, 1]
-    
     if ACCEL_IN_G:
-        accel = accel * G_CONST   # g → m/s²
+        accel = accel * G_CONST
     return t, accel
 
 # ============================================================
-# 2. EDP 计算核心函数
+# EDP 计算核心
 # ============================================================
-def compute_edps_for_folder(folder_path):
-    """计算单个 output 文件夹的 5 个 EDP (严格按论文定义)"""
-    
-    # ---- 读取位移 & 速度 ----
+def compute_edps(folder_path):
     disp_path = os.path.join(folder_path, "disp_all.out")
     vel_path  = os.path.join(folder_path, "vel_all.out")
     
@@ -97,70 +74,51 @@ def compute_edps_for_folder(folder_path):
     ux, uy, uz = disp[:, 1], disp[:, 2], disp[:, 3]
     vx, vy, vz = vel[:, 1], vel[:, 2], vel[:, 3]
     
-    # 时间步长
     dt = np.mean(np.diff(t))
     assert len(t) == len(vx), "位移与速度时间轴长度不一致！"
     print(f"   读取: {len(t)} 步, dt = {dt:.6f} s")
     
-    # ---- 读取三向地震波并插值对齐 ----
+    # 读取地震波并插值对齐
     t_x, ag_x = read_accel_file(FILES_ACCEL['X'], dt)
     t_y, ag_y = read_accel_file(FILES_ACCEL['Y'], dt)
     t_z, ag_z = read_accel_file(FILES_ACCEL['Z'], dt)
-    
     ag_x = np.interp(t, t_x, ag_x)
     ag_y = np.interp(t, t_y, ag_y)
     ag_z = np.interp(t, t_z, ag_z)
     
-    # ---- 合成位移 ----
-    disp_3d = np.sqrt(ux**2 + uy**2 + uz**2)      # 三维合成
-    disp_h  = np.sqrt(ux**2 + uy**2)              # 水平合成 (用于RVH)
+    disp_3d = np.sqrt(ux**2 + uy**2 + uz**2)
+    disp_h  = np.sqrt(ux**2 + uy**2)
     
-    # =========================================================
-    # EDP 1: D_cum,3D (三维累积位移)
-    # =========================================================
+    # EDP 1
     D_cum_3D = np.trapz(disp_3d, t)
     
-    # =========================================================
-    # EDP 2: E_in (输入能量)
-    # =========================================================
+    # EDP 2
     power_sum = ag_x * vx + ag_y * vy + ag_z * vz
     E_in = -MASS * np.trapz(power_sum, t)
     
-    # =========================================================
-    # EDP 3: D_w,peak (持时加权峰值位移)
-    # 加权函数：绝对输入功率 |a_g·v|
-    # =========================================================
-    abs_power = (np.abs(ag_x * vx) + 
-                 np.abs(ag_y * vy) + 
-                 np.abs(ag_z * vz))
+    # EDP 3 (持时窗口基于绝对输入功率)
+    abs_power = (np.abs(ag_x * vx) + np.abs(ag_y * vy) + np.abs(ag_z * vz))
     cum_weight = np.cumsum(abs_power * dt)
     cum_weight_norm = cum_weight / cum_weight[-1]
-    
     idx_5 = np.searchsorted(cum_weight_norm, 0.05)
     idx_95 = np.searchsorted(cum_weight_norm, 0.95)
     if idx_5 == idx_95:
         idx_5, idx_95 = 0, len(t) - 1
-    
     D_w_peak = np.max(disp_3d[idx_5:idx_95])
     t5, t95 = t[idx_5], t[idx_95]
     
-    # =========================================================
-    # EDP 4: D_3D,max (三维峰值位移)
-    # =========================================================
+    # EDP 4
     D_3D_max = np.max(disp_3d)
     idx_max_3d = np.argmax(disp_3d)
     t_max_3d = t[idx_max_3d]
     
-    # =========================================================
-    # EDP 5: R_VH (竖向与水平向位移比)
-    # =========================================================
+    # EDP 5
     max_uz = np.max(np.abs(uz))
     max_h  = np.max(disp_h)
     R_VH = max_uz / (max_h + EPS)
     idx_max_uz = np.argmax(np.abs(uz))
     t_max_uz = t[idx_max_uz]
     
-    # ---- 返回结果 ----
     return {
         "Folder": os.path.basename(folder_path),
         "D_cum_3D (m)": D_cum_3D,
@@ -179,55 +137,113 @@ def compute_edps_for_folder(folder_path):
     }
 
 # ============================================================
-# 3. 主程序（单文件夹模式）
+# 自动搜索文件夹
+# ============================================================
+def find_output_folders():
+    """返回当前目录及子目录下所有 outputs_* 文件夹的绝对路径列表"""
+    # 先在当前目录找
+    candidates = glob.glob("outputs_*")
+    candidates = [os.path.abspath(f) for f in candidates if os.path.isdir(f)]
+    # 再在子目录找（深度1）
+    subdirs = [d for d in glob.glob("*") if os.path.isdir(d)]
+    for sub in subdirs:
+        sub_candidates = glob.glob(os.path.join(sub, "outputs_*"))
+        for f in sub_candidates:
+            if os.path.isdir(f):
+                candidates.append(os.path.abspath(f))
+    # 去重
+    candidates = list(set(candidates))
+    return sorted(candidates)
+
+# ============================================================
+# 主程序
 # ============================================================
 if __name__ == "__main__":
+    print("=" * 70)
+    print("  OpenSees 月震 EDP 后处理 (最终健壮版)")
+    print("=" * 70)
+    print(f"当前工作目录: {os.getcwd()}")
+    print("正在搜索 outputs_* 文件夹...")
     
-    print("=" * 60)
-    print("单文件夹 EDP 计算")
-    print(f"目标文件夹: {TARGET_FOLDER}")
+    folders = find_output_folders()
+    
+    if not folders:
+        print("\n❌ 未找到任何 outputs_* 文件夹！")
+        print("请确保：")
+        print("  1. 已将本脚本放在与 'outputs_mesh_10' 文件夹相同的目录下。")
+        print("  2. 如果放在子目录，请将脚本移到正确位置。")
+        print("  3. 或者使用绝对路径运行，例如：")
+        print("     python compute_EDP.py --folder /完整/路径/outputs_mesh_10")
+        sys.exit(1)
+    
+    # 显示找到的文件夹
+    print(f"\n找到 {len(folders)} 个 outputs_* 文件夹：")
+    for i, f in enumerate(folders):
+        print(f"  {i+1}. {f}")
+    
+    # 选择
+    if len(folders) == 1:
+        target = folders[0]
+        print(f"\n自动选用唯一文件夹: {target}")
+    else:
+        while True:
+            try:
+                choice = input(f"\n请输入序号 (1-{len(folders)}) 或直接回车选第一个: ")
+                if choice.strip() == "":
+                    target = folders[0]
+                    break
+                idx = int(choice) - 1
+                if 0 <= idx < len(folders):
+                    target = folders[idx]
+                    break
+                else:
+                    print("序号超出范围，请重新输入。")
+            except ValueError:
+                print("请输入有效数字。")
+    
+    print(f"\n目标文件夹: {target}")
     print(f"加速度单位转换 (g→m/s²): {'是' if ACCEL_IN_G else '否'}")
     print("持时窗口定义: 基于绝对输入功率 |a_g·v| 的累积值 5%~95%")
-    print("=" * 60)
+    print("-" * 70)
     
-    # 检查文件夹是否存在
-    if not os.path.exists(TARGET_FOLDER):
-        print(f"❌ 错误: 文件夹 {TARGET_FOLDER} 不存在！")
-        print("请检查文件夹名称是否正确，或修改 TARGET_FOLDER 变量。")
-        sys.exit(1)
+    # 检查必要文件是否存在
+    required = ["disp_all.out", "vel_all.out"]
+    for f in required:
+        if not os.path.exists(os.path.join(target, f)):
+            print(f"❌ 错误: 在 {target} 中找不到 {f}，请确认文件夹内容完整。")
+            sys.exit(1)
     
     # 执行计算
     try:
-        res = compute_edps_for_folder(TARGET_FOLDER)
+        res = compute_edps(target)
     except Exception as e:
         print(f"❌ 计算失败: {e}")
         sys.exit(1)
     
-    # ---- 打印结果 ----
-    print("\n" + "=" * 60)
+    # 打印结果
+    print("\n" + "=" * 70)
     print("📊 EDP 计算结果")
-    print("=" * 60)
+    print("=" * 70)
     print(f"D_cum,3D  = {res['D_cum_3D (m)']:.6e} m")
     print(f"E_in       = {res['E_in (J)']:.6e} J")
     print(f"D_w,peak   = {res['D_w_peak (m)']:.6e} m")
     print(f"D_3D,max   = {res['D_3D_max (m)']:.6e} m")
     print(f"R_VH       = {res['R_VH (-)']:.6f}")
-    print("=" * 60)
+    print("=" * 70)
     print(f"持时窗口: t5 = {res['t5 (s)']:.3f}s, t95 = {res['t95 (s)']:.3f}s")
     print(f"D_3D_max 发生时刻: t = {res['t@D3Dmax (s)']:.3f}s")
     print(f"max|Uz| 发生时刻: t = {res['t@maxUz (s)']:.3f}s")
     
-    # ---- 保存 CSV ----
+    # 保存结果
     df = pd.DataFrame([res])
-    csv_path = "EDP_single_result.csv"
+    csv_path = "EDP_result.csv"
     df.to_csv(csv_path, index=False, float_format="%.6e")
     
-    # ---- 保存简洁文本 ----
-    txt_path = "EDP_single_result.txt"
+    txt_path = "EDP_result.txt"
     with open(txt_path, "w") as f:
-        f.write("Single Folder EDP Results\n")
+        f.write("EDP Results\n")
         f.write("=" * 50 + "\n")
-        f.write(f"Folder: {TARGET_FOLDER}\n")
+        f.write(f"Folder: {target}\n")
         f.write(f"D_cum,3D  = {res['D_cum_3D (m)']:.6e} m\n")
         f.write(f"E_in       = {res['E_in (J)']:.6e} J\n")
         f.write(f"D_w,peak   = {res['D_w_peak (m)']:.6e} m\n")
