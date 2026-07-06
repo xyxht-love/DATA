@@ -11,7 +11,7 @@ wipe
 # ====================================================
 set tolerance 1.0e-8
 set maxIterations 100
-set printInterval 50000          ;# 减少终端输出频率
+set printInterval 10000          ;# 减少终端输出频率
 
 # ====================================================
 # 1. 工具函数：统计文件行数（忽略空行）
@@ -322,12 +322,14 @@ pattern UniformExcitation 1 1 -accel 1
 timeSeries Path 2 -dt $dt -filePath $fileY -column 2 -factor $factorY
 pattern UniformExcitation 2 2 -accel 2
 
-timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor $factorZ
+# <<<<<<< 修改：combine.txt 只有一列，所以使用 -column 1
+timeSeries Path 3 -dt $dt -filePath $fileZ -column 1 -factor $factorZ
+# >>>>>>> 修改结束
 pattern UniformExcitation 3 3 -accel 3
 
 puts "X向输入: $fileX (列2)"
 puts "Y向输入: $fileY (列2)"
-puts "Z向输入: $fileZ (列2)"
+puts "Z向输入: $fileZ (列1，因为该文件只有一列)"
 
 # ====================================================
 # 9. 输出记录器（监控顶部节点）
