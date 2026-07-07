@@ -17,8 +17,12 @@ import pandas as pd
 # ============================================================
 # 用户可调参数（与 Tcl 完全一致）
 # ============================================================
-ACCEL_IN_G = True          # True: 地震波文件单位为 g (自动×9.81)
-G_CONST = 1.62
+# ★★★ 重要：请根据地震波文件的实际单位设置以下参数 ★★★
+# 若文件数值为月球重力加速度 (g_moon = 1.62 m/s²) 的倍数，则 ACCEL_IN_G=True, G_CONST=1.62
+# 若文件数值为 m/s²，则 ACCEL_IN_G=False 或 G_CONST=1.0
+# 若文件数值为地球重力加速度 (g = 9.81) 的倍数，则 ACCEL_IN_G=True, G_CONST=9.81
+ACCEL_IN_G = True          # True: 地震波文件单位为 g (自动×G_CONST)
+G_CONST = 1.62             # 月球重力加速度 (m/s²)，请根据文件单位修改
 EPS = 1.0e-12
 
 # 结构几何与材料（用于计算梁总质量）
@@ -85,17 +89,18 @@ def read_accel_file_fixed(dt_ref=0.01):
     t_z, az = read_one(ACCEL_FILES['Z'])
     return t_x, ax, t_y, ay, t_z, az
 
-def get_node_masses(nn, beam_mass):
+def get_node_masses(n_mass_nodes, beam_mass):
     """
-    根据节点数 nn 和梁总质量 beam_mass 计算各节点质量。
-    匹配 Tcl 定义：
-      - 内部节点 (nn-1 个)：质量 = beam_mass / (nn - 0.5)
-      - 顶部节点：质量 = 内部节点质量 / 2
+    根据质量节点数量 n_mass_nodes 和梁总质量 beam_mass 计算各节点质量。
+    严格匹配 Tcl 定义：
+      - 内部节点 (n_mass_nodes-1 个)：质量 = beam_mass / (n_mass_nodes - 0.5)
+      - 顶部节点 (最后一个)：质量 = 内部节点质量 / 2
+    说明：n_mass_nodes 等于 numEle（因为输出节点为 2~topNode，共 numEle 个）
     """
-    if nn <= 1:
+    if n_mass_nodes <= 1:
         return np.array([beam_mass])
-    m_internal = beam_mass / (nn - 0.5)   # 推导： (nn-1)*m_i + 0.5*m_i = beam_mass
-    masses = np.full(nn, m_internal)
+    m_internal = beam_mass / (n_mass_nodes - 0.5)   # 推导： (n-1)*m_i + 0.5*m_i = beam_mass
+    masses = np.full(n_mass_nodes, m_internal)
     masses[-1] = 0.5 * m_internal
     return masses
 
@@ -115,8 +120,16 @@ def compute_edps(folder_path, case_id):
     
     dt = np.mean(np.diff(t))
     nt = len(t)
-    nn = disp.shape[1]          # 节点数量（与 numEle 一致）
+    nn = disp.shape[1]          # 质量节点数量（应等于 numEle）
     print(f"   读取: {nt} 步, dt = {dt:.6f} s, 节点数 = {nn}")
+    
+    # 从 case_id 提取 numEle 并核对
+    try:
+        numEle = int(case_id.split("_")[1]) if "_" in case_id else None
+        if numEle is not None and nn != numEle:
+            print(f"   ⚠️ 警告：输出节点数 {nn} 与理论 numEle {numEle} 不一致")
+    except:
+        pass
     
     # 节点质量分配
     masses = get_node_masses(nn, BEAM_MASS)
@@ -258,7 +271,7 @@ if __name__ == "__main__":
             res = compute_edps(folder, case_id)
             results.append(res)
             
-            # ★★★ 修改：打印全部 EDP 及辅助时间信息 ★★★
+            # 打印全部 EDP 及辅助时间信息
             print(f"  D_cum_3D = {res['D_cum_3D (m)']:.6e} m")
             print(f"  E_in     = {res['E_in (J)']:.6e} J")
             print(f"  D_w_peak = {res['D_w_peak (m)']:.6e} m")
@@ -292,6 +305,7 @@ if __name__ == "__main__":
         f.write("3. E_in 为梯形累积输入能量最大值\n")
         f.write("4. D_w_peak 窗口基于各方向绝对功率之和（5%%-95%% 闭区间）\n")
         f.write("5. R_VH 为全结构竖向动能 / 水平动能（质量加权速度平方积分）\n")
+        f.write("6. 加速度单位：请确认 ACCEL_IN_G 和 G_CONST 设置与地震波文件单位一致\n")
     
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
