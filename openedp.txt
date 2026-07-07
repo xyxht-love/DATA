@@ -213,8 +213,20 @@ def compute_edps(folder_path, case_id):
 # 主程序：自动搜索并批量处理
 # ============================================================
 def find_folders():
-    """搜索所有 outputs_mesh_* 文件夹"""
-    return sorted(glob.glob("outputs_mesh_*"))
+    """
+    ★★★ 修改点 ★★★
+    只匹配 outputs_mesh_数字 格式的文件夹，并按数字大小排序。
+    避免读入无关目录（如 outputs_mesh_backup 等）。
+    """
+    folders = []
+    for f in glob.glob("outputs_mesh_*"):
+        if os.path.isdir(f):
+            base = os.path.basename(f)
+            if re.match(r"^outputs_mesh_\d+$", base):
+                folders.append(f)
+    # 按数字大小排序
+    folders.sort(key=lambda x: int(re.search(r'\d+', x).group()))
+    return folders
 
 def extract_case_id(folder_name):
     """从 outputs_mesh_10 提取 'mesh_10'"""
