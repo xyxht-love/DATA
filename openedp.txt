@@ -214,7 +214,6 @@ def compute_edps(folder_path, case_id):
 # ============================================================
 def find_folders():
     """
-    ★★★ 修改点 ★★★
     只匹配 outputs_mesh_数字 格式的文件夹，并按数字大小排序。
     避免读入无关目录（如 outputs_mesh_backup 等）。
     """
@@ -258,8 +257,17 @@ if __name__ == "__main__":
             print(f"\n处理 {folder} (Case={case_id}) ...")
             res = compute_edps(folder, case_id)
             results.append(res)
-            print(f"  E_in = {res['E_in (J)']:.6e} J")
-            print(f"  R_VH = {res['R_VH (-)']:.6e}")
+            
+            # ★★★ 修改：打印全部 EDP 及辅助时间信息 ★★★
+            print(f"  D_cum_3D = {res['D_cum_3D (m)']:.6e} m")
+            print(f"  E_in     = {res['E_in (J)']:.6e} J")
+            print(f"  D_w_peak = {res['D_w_peak (m)']:.6e} m")
+            print(f"  D_3D_max = {res['D_3D_max (m)']:.6e} m")
+            print(f"  R_VH     = {res['R_VH (-)']:.6e}")
+            print(f"  持时窗口: t5 = {res['t5 (s)']:.3f} s, t95 = {res['t95 (s)']:.3f} s")
+            print(f"  D_3D_max 发生时刻: t = {res['t@D3Dmax (s)']:.3f} s")
+            print(f"  max|Uz| 发生时刻: t = {res['t@maxUz (s)']:.3f} s")
+            
         except Exception as e:
             print(f"  ❌ 处理失败: {e}")
     
