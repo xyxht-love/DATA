@@ -1,7 +1,8 @@
 # ====================================================
-# model_fixed_numEle10_stable.tcl
+# PAPER_FINAL_MODEL.tcl
 # 竖直悬臂杆 - 三向月震输入，固定网格 numEle=10
 # 完全符合论文第4章论述：顶部集中质量3000kg，KrylovNewton算法
+# 修改：Rayleigh经典形式、Newmark 0.6/0.3025、固定步长、重力10步
 # ====================================================
 
 wipe
@@ -135,7 +136,7 @@ for {set i 1} {$i <= $numEle} {incr i} {
 }
 
 # ====================================================
-# 7. 重力分析（荷载与质量一致）
+# 7. 重力分析（荷载与质量一致，10步加载）
 # ====================================================
 pattern Plain 10 Linear {
     for {set i 2} {$i < $topNode} {incr i} {
@@ -149,9 +150,9 @@ numberer RCM
 system BandGeneral
 test NormDispIncr $tolerance $maxIterations 0
 algorithm Newton
-integrator LoadControl 1.0
+integrator LoadControl 0.1        ;# 分10步施加自重
 analysis Static
-set okGravity [analyze 1]
+set okGravity [analyze 10]       ;# 10步
 
 if {$okGravity != 0} {
     puts "重力分析失败，退出！"
@@ -160,7 +161,7 @@ if {$okGravity != 0} {
 wipeAnalysis
 
 # ====================================================
-# 8. 模态分析（仅取前2阶，用于Rayleigh阻尼）
+# 8. 模态分析（取前2阶，用于Rayleigh阻尼）
 # ====================================================
 set numModes 2
 set eigenValues [eigen -fullGenLapack $numModes]
@@ -218,11 +219,11 @@ for {set i 1} {$i <= $numModes} {incr i} {
 # 若未识别，采用理论估算值
 set k_axial [expr {$E*$A/$L}]
 set k_bend  [expr {3.0*$E*$Iy/pow($L,3)}]
-if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt(($m + $M_add) / $k_bend)}] }   ;# 计入顶部质量
+if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt(($m + $M_add) / $k_bend)}] }
 if {$T_vertical == 0.0}   { set T_vertical   [expr {2.0 * $pi * sqrt(($m + $M_add) / $k_axial)}] }
 
 # ====================================================
-# 9. Rayleigh 阻尼（修正参数顺序）
+# 9. Rayleigh 阻尼（经典形式：alphaM + betaK）
 # ====================================================
 if {$omega1 > 0 && $omega2 > 0} {
     set alphaM [expr {2.0 * $zeta * $omega1 * $omega2 / ($omega1 + $omega2)}]
@@ -234,7 +235,7 @@ if {$omega1 > 0 && $omega2 > 0} {
     set alphaM 0.0
     set betaK  0.0
 }
-rayleigh $alphaM 0.0 0.0 $betaK
+rayleigh $alphaM $betaK 0 0        ;# 经典形式：质量比例 + 当前刚度比例
 
 # ====================================================
 # 10. 地震输入
@@ -267,14 +268,15 @@ puts $fp_period "顶部附加质量 M_add = $M_add kg"
 puts $fp_period "水平向特征周期 T_h = [format %.6f $T_horizontal] s"
 puts $fp_period "竖直向特征周期 T_v = [format %.6f $T_vertical] s"
 puts $fp_period "Rayleigh阻尼系数 alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
+puts $fp_period "Newmark参数 gamma = 0.6, beta = 0.3025"
 close $fp_period
 
 # ====================================================
-# 12. 时程分析（KrylovNewton + 常加速度Newmark）
+# 12. 时程分析（KrylovNewton + 固定步长 Newmark）
 # ====================================================
 puts "\n========== 时程分析 =========="
-set gamma 0.5
-set beta 0.25
+set gamma 0.6
+set beta 0.3025
 constraints Transformation
 numberer RCM
 system BandGeneral
@@ -295,15 +297,8 @@ while {$step < $nPoints} {
         incr successfulSteps
     } else {
         incr failedSteps
-        # 减半步长重试一次
-        set dt_half [expr {$dt / 2.0}]
-        set ok2 [analyze 2 $dt_half]
-        if {$ok2 == 0} {
-            incr successfulSteps
-            incr step
-        } else {
-            puts "警告：步 $step 失败，跳过"
-        }
+        puts "错误：步 $step 分析失败，固定步长无法继续，提前终止。"
+        break
     }
     # 进度输出
     if {$step % $printInterval == 0} {
