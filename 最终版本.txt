@@ -1,6 +1,6 @@
 # ====================================================
 # model_final_science.tcl
-# SCI论文最终版（修正版）
+# SCI论文最终版（修正版）—— 与 Python Final Science 对接
 # ====================================================
 
 wipe
@@ -321,7 +321,7 @@ set outputDir "outputs_mesh_${numEle}"
 file mkdir $outputDir
 
 # ====================================================
-# Recorder（全部质量节点）
+# Recorder（全部质量节点 + 地面加速度）
 # ====================================================
 
 puts ""
@@ -329,34 +329,39 @@ puts "==============================="
 puts "Recorder"
 puts "==============================="
 
+# --- 地面加速度（固定节点1） ---
+recorder Node -file "$outputDir/ground_accel.out" -time -node 1 -dof 1 2 3 accel
+
+# --- 结构响应（质量节点 2 ~ topNode） ---
 recorder Node -file "$outputDir/disp_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 disp
 recorder Node -file "$outputDir/vel_all.out"  -time -nodeRange 2 $topNode -dof 1 2 3 vel
 recorder Node -file "$outputDir/accel_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 accel
 recorder Element -file "$outputDir/beam_forces.out" -time -ele 1 force
 
-# ----------------------------------------------------
-# 保存模型信息
-# ----------------------------------------------------
-set fp [open "$outputDir/structural_periods.txt" w]
-puts $fp "# model_final_science (corrected)"
-puts $fp "AnalysisTime=[clock format [clock seconds]]"
-puts $fp ""
-puts $fp "numEle=$numEle"
-puts $fp "BeamMass=$beamMass"
-puts $fp "TopMass=$M_add"
-puts $fp ""
-puts $fp "T_horizontal=$T_horizontal"
-puts $fp "T_vertical=$T_vertical"
-puts $fp ""
-puts $fp "alphaM=$alphaM"
-puts $fp "betaK=$betaK"
-puts $fp "Newmark_gamma=0.5"   ;# 或改为0.6，视您选择
-puts $fp "Newmark_beta=0.25"
+# ====================================================
+# 输出模型信息（供 Python 读取）
+# ====================================================
+
+# --- model_info.txt ---
+set fp [open "$outputDir/model_info.txt" w]
+puts $fp "numEle $numEle"
+puts $fp "M_add $M_add"
+puts $fp "BeamMass $beamMass"
+puts $fp "start_node 2"
 close $fp
+
+# --- structural_periods.txt（简洁格式） ---
+set fp [open "$outputDir/structural_periods.txt" w]
+puts $fp "T_h = $T_horizontal"
+puts $fp "T_v = $T_vertical"
+close $fp
+
+# (可选) 也可保留详细的周期信息，但 Python 只读取上述两行
 
 puts ""
 puts "Output folder : $outputDir"
 puts "Recorder initialization finished."
+puts "Model info and periods saved."
 
 # ====================================================
 # 第4部分：时程分析（固定步长，无自动减半）
@@ -394,8 +399,6 @@ while {$step < $nPoints} {
         # 仅输出警告，不改变步长，保证所有分析步长一致
         puts "Warning : Step $step failed (continuing with fixed dt)."
         # 若失败过多可考虑提前终止，但这里跳过（继续下一增量步）
-        # 注意：analyze失败后模型状态可能不收敛，简单起见我们跳过该步并继续。
-        # 更严谨的做法是直接终止，但这里保留继续。
     }
 
     if {$step % $printInterval == 0} {
@@ -444,22 +447,6 @@ if {[llength $beamForce] >= 6} {
     puts "Mz = [format %.3f [lindex $beamForce 5]] N·m"
 }
 
-# 1. 输出地面加速度 (节点1通常为固定端)
-recorder Node -file ground_accel.out -time -node 1 -dof 1 2 3 accel
-
-# 2. 输出模型关键参数 (用于 Python 自动读取)
-set fp [open model_info.txt w]
-puts $fp "numEle $numEle"
-puts $fp "M_add $M_add"
-puts $fp "BeamMass $BEAM_MASS"
-puts $fp "start_node 2"
-close $fp
-
-# 3. 输出结构周期 (确保特征值分析已执行)
-set fp [open structural_periods.txt w]
-puts $fp "T_h = [lindex $eigenvalues 0]"
-puts $fp "T_v = [lindex $eigenvalues 1]"
-close $fp
 puts ""
 puts "Output directory : $outputDir"
 puts "Model finished."
