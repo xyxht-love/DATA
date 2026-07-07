@@ -1,0 +1,220 @@
+# ====================================================
+# MODIFIED_TCL_FOR_MESH_CONVERGENCE.tcl
+# 竖直悬臂杆 - 三向月震输入，输出所有节点，支持不同网格数
+# ====================================================
+
+wipe
+
+# ====================================================
+# 1. 工具函数：统计行数
+# ====================================================
+proc countLines {filename} {
+    set count 0
+    if {[file exists $filename]} {
+        set fp [open $filename r]
+        while {[gets $fp line] >= 0} {
+            if {[string trim $line] ne ""} {incr count}
+        }
+        close $fp
+    }
+    return $count
+}
+
+# ====================================================
+# 2. 固定地震波文件名（不修改）
+# ====================================================
+set fileX "MH1.txt"
+set fileY "MH2.txt"
+set fileZ "combine.txt"
+
+# 检查文件是否存在
+if {![file exists $fileX]} { puts "错误：$fileX 不存在" ; exit 1 }
+if {![file exists $fileY]} { puts "错误：$fileY 不存在" ; exit 1 }
+if {![file exists $fileZ]} { puts "错误：$fileZ 不存在" ; exit 1 }
+
+# 读取时间步数（假设三个文件长度一致）
+set dt 0.01
+set nPointsX [countLines $fileX]
+set nPointsY [countLines $fileY]
+set nPointsZ [countLines $fileZ]
+set nPoints [expr {min($nPointsX, min($nPointsY, $nPointsZ))}]
+set totalTime [expr {$nPoints * $dt}]
+
+puts "地震记录信息："
+puts "  X: $fileX, 点数 = $nPointsX"
+puts "  Y: $fileY, 点数 = $nPointsY"
+puts "  Z: $fileZ, 点数 = $nPointsZ"
+puts "  分析步数 = $nPoints, dt = $dt s, 总时长 = [format %.2f $totalTime] s"
+
+# ====================================================
+# 3. 结构参数（固定）
+# ====================================================
+set g_earth 9.81
+set g_moon 1.62
+set E 69.0e9
+set nu 0.33
+set rho 2700.0
+set G 26.0e9
+set fy 276.0e6
+set L 4.5
+set D 0.35
+set t_wall 0.035
+set pi 3.141592653589793
+
+set R_out [expr {$D/2.0}]
+set R_in  [expr {$R_out - $t_wall}]
+set A_cross [expr {$pi * ($R_out**2 - $R_in**2)}]
+set Iy  [expr {$pi/64.0 * (pow($D,4) - pow($D-2*$t_wall,4))}]
+set Iz  $Iy
+set J   [expr {2.0 * $Iy}]
+set m_total [expr {$rho * $A_cross * $L}]   ;# 梁总质量
+
+# 阻尼比
+set zeta 0.05
+
+# ====================================================
+# 4. 网格数量列表（可根据需要修改）
+# ====================================================
+set meshList {1 2 4 8 10 12 16}
+
+# ====================================================
+# 5. 主循环：对每个网格数
+# ====================================================
+foreach numEle $meshList {
+
+    puts "\n================================================"
+    puts "开始处理网格数 numEle = $numEle"
+    puts "================================================"
+
+    set outputDir "outputs_mesh_${numEle}"
+    file mkdir $outputDir
+
+    # ---- 5.1 计算网格相关参数 ----
+    set dz [expr {$L / $numEle}]
+    set topNode [expr {$numEle + 1}]
+    set mEle [expr {$m_total / $numEle}]
+
+    # ---- 5.2 建模 ----
+    model BasicBuilder -ndm 3 -ndf 6
+
+    for {set i 1} {$i <= $topNode} {incr i} {
+        set z [expr {($i - 1) * $dz}]
+        node $i 0.0 0.0 $z
+    }
+    fix 1 1 1 1 1 1
+
+    # 质量分配（内部节点 mEle，顶部节点 mEle/2）
+    for {set i 2} {$i < $topNode} {incr i} {
+        mass $i $mEle $mEle $mEle 0 0 0
+    }
+    mass $topNode [expr {$mEle/2.0}] [expr {$mEle/2.0}] [expr {$mEle/2.0}] 0 0 0
+
+    geomTransf Linear 1 0 1 0
+    for {set i 1} {$i <= $numEle} {incr i} {
+        element elasticBeamColumn $i $i [expr {$i+1}] $A_cross $E $G $J $Iy $Iz 1
+    }
+
+    # ---- 5.3 重力分析 ----
+    pattern Plain 10 Linear {
+        for {set i 2} {$i < $topNode} {incr i} {
+            load $i 0.0 0.0 [expr {-$mEle * $g_moon}] 0.0 0.0 0.0
+        }
+        load $topNode 0.0 0.0 [expr {-$mEle/2.0 * $g_moon}] 0.0 0.0 0.0
+    }
+    constraints Transformation
+    numberer RCM
+    system BandGeneral
+    test NormDispIncr 1.0e-8 100 0
+    algorithm Newton
+    integrator LoadControl 0.1
+    analysis Static
+    analyze 10
+    wipeAnalysis
+
+    # ---- 5.4 模态分析 ----
+    set numModes 3
+    set eigenValues [eigen $numModes]
+    set omega1 0.0
+    set omega2 0.0
+    for {set i 0} {$i < $numModes} {incr i} {
+        set lambda [lindex $eigenValues $i]
+        if {$lambda > 0} {
+            if {$i == 0} { set omega1 [expr {sqrt($lambda)}] }
+            if {$i == 1} { set omega2 [expr {sqrt($lambda)}] }
+        }
+    }
+    if {$omega1 > 0 && $omega2 > 0} {
+        set alphaM [expr {2.0 * $zeta * $omega1 * $omega2 / ($omega1 + $omega2)}]
+        set betaK  [expr {2.0 * $zeta / ($omega1 + $omega2)}]
+    } elseif {$omega1 > 0} {
+        set alphaM 0.0
+        set betaK  [expr {2.0 * $zeta / $omega1}]
+    } else {
+        set alphaM 0.0
+        set betaK  0.0
+    }
+    rayleigh $alphaM 0.0 $betaK 0.0
+
+    # ---- 5.5 地震输入（使用固定文件） ----
+    remove loadPattern 10
+    timeSeries Path 1 -dt $dt -filePath $fileX -column 2 -factor 1.0
+    pattern UniformExcitation 1 1 -accel 1
+    timeSeries Path 2 -dt $dt -filePath $fileY -column 2 -factor 1.0
+    pattern UniformExcitation 2 2 -accel 2
+    timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor 1.0
+    pattern UniformExcitation 3 3 -accel 3
+
+    # ---- 5.6 ★★★ 输出所有质量节点（2 ~ topNode）★★★ ----
+    recorder Node -file "$outputDir/disp_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 disp
+    recorder Node -file "$outputDir/vel_all.out"  -time -nodeRange 2 $topNode -dof 1 2 3 vel
+
+    # 可选：保存周期信息
+    set fp_period [open "$outputDir/structural_periods.txt" w]
+    puts $fp_period "numEle = $numEle, topNode = $topNode"
+    puts $fp_period "omega1 = [format %.4e $omega1], omega2 = [format %.4e $omega2]"
+    puts $fp_period "alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
+    close $fp_period
+
+    # ---- 5.7 时程分析 ----
+    puts "开始时程分析 numEle=$numEle ..."
+    set gamma 0.6
+    set beta 0.3025
+    constraints Transformation
+    numberer RCM
+    system BandGeneral
+    test EnergyIncr 1.0e-8 100 0
+    algorithm KrylovNewton
+    integrator Newmark $gamma $beta
+    analysis Transient
+
+    set step 0
+    set successfulSteps 0
+    set failedSteps 0
+
+    while {$step < $nPoints} {
+        incr step
+        set ok [analyze 1 $dt]
+        if {$ok == 0} {
+            incr successfulSteps
+        } else {
+            incr failedSteps
+            # 失败时尝试减半步长
+            set dt_half [expr {$dt / 2.0}]
+            set ok2 [analyze 2 $dt_half]
+            if {$ok2 == 0} {
+                incr successfulSteps
+                incr step
+            } else {
+                puts "警告：numEle=$numEle 步 $step 失败，跳过"
+            }
+        }
+        if {$step % 10000 == 0} {
+            puts "  进度: $step / $nPoints, 成功=$successfulSteps, 失败=$failedSteps"
+        }
+    }
+
+    puts "numEle=$numEle 分析完成: 成功=$successfulSteps, 失败=$failedSteps"
+    wipe
+}
+
+puts "\n所有网格数处理完成！"
