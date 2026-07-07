@@ -2,12 +2,13 @@
 """
 OpenSees EDP 后处理 (网格收敛性分析，与论文定义完全一致)
 - 固定地震波：MH1.txt, MH2.txt, combine.txt
+- 加速度文件格式：第一列时间 (s)，第二列加速度 (m/s²)
 - 自动搜索 outputs_mesh_* 文件夹
 - 读取所有质量节点位移/速度，计算 5 个 EDP
 - 质量分配严格匹配 Tcl（内部节点 mEle，顶部节点 mEle/2）
 - E_in 采用分布质量 + 梯形累积 + 绝对值最大值
 - D_w_peak 采用所有节点总功率绝对值窗口
-- R_VH 采用速度平方积分（动能比），而非位移平方
+- R_VH 采用速度平方积分（动能比）
 """
 
 import os
@@ -20,10 +21,9 @@ import pandas as pd
 # ============================================================
 # 用户可调参数（与 Tcl 完全一致）
 # ============================================================
-# 加速度单位转换：若地震波文件为月球重力加速度 (g_moon = 1.62 m/s²) 的倍数，则 ACCEL_IN_G=True, G_CONST=1.62
-# 若文件为 m/s²，则 ACCEL_IN_G=False 或 G_CONST=1.0
-ACCEL_IN_G = True
-G_CONST = 1.62             # 月球重力加速度 (m/s²)，根据文件单位调整
+# ★★★ 加速度单位：文件已为 m/s²，故 ACCEL_IN_G = False ★★★
+ACCEL_IN_G = False          # False: 直接使用文件数值（m/s²），不做缩放
+G_CONST = 1.62              # 仅当 ACCEL_IN_G=True 时使用（月球重力加速度）
 EPS = 1.0e-12
 
 # 结构几何与材料（用于计算梁总质量）
@@ -68,19 +68,22 @@ def read_opensees_out_all_nodes(filepath):
 def read_accel_file_fixed(dt_ref=0.01):
     """
     读取固定的三向地震波文件（MH1.txt, MH2.txt, combine.txt）。
+    文件格式：第一列为时间 (s)，第二列为加速度 (m/s²)。
     返回插值到结构时间轴所需的 (t, accel)。
     """
     def read_one(fpath):
         data = np.loadtxt(fpath)
         if data.ndim == 1:
             data = data.reshape(-1, 1)
+        # 若只有一列，则假定时间步长为 dt_ref
         if data.shape[1] == 1:
             n = data.shape[0]
             t = np.arange(n) * dt_ref
             accel = data[:, 0]
         else:
-            t = data[:, 0]
-            accel = data[:, 1]
+            t = data[:, 0]      # 第一列为时间
+            accel = data[:, 1]  # 第二列为加速度
+        # 根据 ACCEL_IN_G 决定是否缩放
         if ACCEL_IN_G:
             accel = accel * G_CONST
         return t, accel
@@ -301,7 +304,7 @@ if __name__ == "__main__":
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
         f.write("【计算说明】\n")
-        f.write("1. 地震波固定为 MH1.txt, MH2.txt, combine.txt\n")
+        f.write("1. 地震波固定为 MH1.txt, MH2.txt, combine.txt，单位为 m/s²（ACCEL_IN_G = False）\n")
         f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点为内部的一半（严格匹配 Tcl）\n")
         f.write("3. E_in 为梯形累积输入能量绝对值最大值（分布质量）\n")
         f.write("4. D_w_peak 窗口基于所有节点总功率绝对值（5%%-95%% 闭区间）\n")
