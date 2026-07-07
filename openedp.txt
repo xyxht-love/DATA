@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees EDP 后处理 (适配方案一：按网格数循环)
+OpenSees EDP 后处理 (网格收敛性分析，与论文定义完全一致)
 - 固定地震波：MH1.txt, MH2.txt, combine.txt
 - 自动搜索 outputs_mesh_* 文件夹
 - 读取所有质量节点位移/速度，计算 5 个 EDP
-- 节点质量分配：内部节点相同，顶部节点为内部的一半（与 Tcl 严格一致）
+- 质量分配严格匹配 Tcl（内部节点 mEle，顶部节点 mEle/2）
+- E_in 采用分布质量 + 梯形累积 + 绝对值最大值
+- D_w_peak 采用所有节点总功率绝对值窗口
+- R_VH 采用速度平方积分（动能比），而非位移平方
 """
 
 import os
@@ -17,12 +20,10 @@ import pandas as pd
 # ============================================================
 # 用户可调参数（与 Tcl 完全一致）
 # ============================================================
-# ★★★ 重要：请根据地震波文件的实际单位设置以下参数 ★★★
-# 若文件数值为月球重力加速度 (g_moon = 1.62 m/s²) 的倍数，则 ACCEL_IN_G=True, G_CONST=1.62
-# 若文件数值为 m/s²，则 ACCEL_IN_G=False 或 G_CONST=1.0
-# 若文件数值为地球重力加速度 (g = 9.81) 的倍数，则 ACCEL_IN_G=True, G_CONST=9.81
-ACCEL_IN_G = True          # True: 地震波文件单位为 g (自动×G_CONST)
-G_CONST = 1.62             # 月球重力加速度 (m/s²)，请根据文件单位修改
+# 加速度单位转换：若地震波文件为月球重力加速度 (g_moon = 1.62 m/s²) 的倍数，则 ACCEL_IN_G=True, G_CONST=1.62
+# 若文件为 m/s²，则 ACCEL_IN_G=False 或 G_CONST=1.0
+ACCEL_IN_G = True
+G_CONST = 1.62             # 月球重力加速度 (m/s²)，根据文件单位调整
 EPS = 1.0e-12
 
 # 结构几何与材料（用于计算梁总质量）
@@ -91,15 +92,14 @@ def read_accel_file_fixed(dt_ref=0.01):
 
 def get_node_masses(n_mass_nodes, beam_mass):
     """
-    根据质量节点数量 n_mass_nodes 和梁总质量 beam_mass 计算各节点质量。
-    严格匹配 Tcl 定义：
-      - 内部节点 (n_mass_nodes-1 个)：质量 = beam_mass / (n_mass_nodes - 0.5)
-      - 顶部节点 (最后一个)：质量 = 内部节点质量 / 2
-    说明：n_mass_nodes 等于 numEle（因为输出节点为 2~topNode，共 numEle 个）
+    严格匹配 Tcl 质量分配：
+    - 内部节点 (n_mass_nodes-1 个)：质量 = beam_mass / n_mass_nodes
+    - 顶部节点 (最后一个)：质量 = 0.5 * beam_mass / n_mass_nodes
+    总有效质量 = (n_mass_nodes - 0.5) * beam_mass / n_mass_nodes
     """
     if n_mass_nodes <= 1:
         return np.array([beam_mass])
-    m_internal = beam_mass / (n_mass_nodes - 0.5)   # 推导： (n-1)*m_i + 0.5*m_i = beam_mass
+    m_internal = beam_mass / n_mass_nodes
     masses = np.full(n_mass_nodes, m_internal)
     masses[-1] = 0.5 * m_internal
     return masses
@@ -131,7 +131,7 @@ def compute_edps(folder_path, case_id):
     except:
         pass
     
-    # 节点质量分配
+    # 节点质量分配（严格匹配 Tcl）
     masses = get_node_masses(nn, BEAM_MASS)
     total_mass = np.sum(masses)
     
@@ -153,50 +153,53 @@ def compute_edps(folder_path, case_id):
     disp_3d_top = np.sqrt(ux_top**2 + uy_top**2 + uz_top**2)
     disp_h_top  = np.sqrt(ux_top**2 + uy_top**2)
     
-    # ----- EDP 1: D_cum_3D (顶部节点) -----
+    # ----- EDP 1: D_cum_3D (顶部节点三维累计位移) -----
     D_cum_3D = np.trapz(disp_3d_top, t)
     
-    # ----- EDP 2: E_in (所有节点质量加权，梯形累积最大值) -----
+    # ----- EDP 2: E_in (分布质量，梯形累积，取绝对值最大值) -----
     power_sum = np.zeros(nt)
     for i in range(nn):
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
         vz = vel[:, i, 2]
         power_sum += masses[i] * (ag_x * vx + ag_y * vy + ag_z * vz)
-    # 梯形积分累积
     Ein_hist = np.zeros(nt)
     for i in range(1, nt):
         Ein_hist[i] = Ein_hist[i-1] - 0.5 * (power_sum[i] + power_sum[i-1]) * dt
-    E_in = np.max(Ein_hist)
+    E_in = np.max(np.abs(Ein_hist))
     
-    # ----- EDP 3: D_w_peak (各方向绝对功率之和，闭区间) -----
-    abs_power = (np.abs(ag_x * vx_top) + 
-                 np.abs(ag_y * vy_top) + 
-                 np.abs(ag_z * vz_top))
+    # ----- EDP 3: D_w_peak (基于所有节点总功率绝对值窗口) -----
+    total_power = np.zeros(nt)
+    for i in range(nn):
+        vx = vel[:, i, 0]
+        vy = vel[:, i, 1]
+        vz = vel[:, i, 2]
+        total_power += masses[i] * (ag_x * vx + ag_y * vy + ag_z * vz)
+    abs_power = np.abs(total_power)
     cum_weight = np.cumsum(abs_power * dt)
     cum_weight_norm = cum_weight / cum_weight[-1]
     idx_5 = np.searchsorted(cum_weight_norm, 0.05)
     idx_95 = np.searchsorted(cum_weight_norm, 0.95)
     if idx_5 == idx_95:
         idx_5, idx_95 = 0, len(t) - 1
-    D_w_peak = np.max(disp_3d_top[idx_5:idx_95+1])   # 包含 idx_95
+    D_w_peak = np.max(disp_3d_top[idx_5:idx_95+1])
     t5, t95 = t[idx_5], t[idx_95]
     
-    # ----- EDP 4: D_3D_max (顶部节点) -----
+    # ----- EDP 4: D_3D_max (顶部节点三维峰值位移) -----
     D_3D_max = np.max(disp_3d_top)
     idx_max_3d = np.argmax(disp_3d_top)
     t_max_3d = t[idx_max_3d]
     
-    # ----- EDP 5: R_VH (全结构动能比，质量加权速度平方积分) -----
-    int_vz2_w = 0.0
-    int_vh2_w = 0.0
+    # ----- EDP 5: R_VH (质量加权速度平方积分，动能比) -----
+    int_vz2 = 0.0
+    int_vh2 = 0.0
     for i in range(nn):
+        vz = vel[:, i, 2]
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
-        vz = vel[:, i, 2]
-        int_vz2_w += masses[i] * np.trapz(vz**2, t)
-        int_vh2_w += masses[i] * np.trapz(vx**2 + vy**2, t)
-    R_VH = int_vz2_w / (int_vh2_w + EPS)
+        int_vz2 += masses[i] * np.trapz(vz**2, t)
+        int_vh2 += masses[i] * np.trapz(vx**2 + vy**2, t)
+    R_VH = int_vz2 / (int_vh2 + EPS)
     
     # ---- 辅助信息 ----
     max_uz = np.max(np.abs(uz_top))
@@ -205,7 +208,7 @@ def compute_edps(folder_path, case_id):
     t_max_uz = t[idx_max_uz]
     
     return {
-        "Case": case_id,                     # 如 "mesh_10"
+        "Case": case_id,
         "Folder": os.path.basename(folder_path),
         "D_cum_3D (m)": D_cum_3D,
         "E_in (J)": E_in,
@@ -236,7 +239,6 @@ def find_folders():
             base = os.path.basename(f)
             if re.match(r"^outputs_mesh_\d+$", base):
                 folders.append(f)
-    # 按数字大小排序
     folders.sort(key=lambda x: int(re.search(r'\d+', x).group()))
     return folders
 
@@ -250,7 +252,7 @@ def extract_case_id(folder_name):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  OpenSees EDP 后处理 (方案一：网格收敛性分析)")
+    print("  OpenSees EDP 后处理 (网格收敛性分析，与论文定义完全一致)")
     print("=" * 70)
     
     folders = find_folders()
@@ -271,7 +273,6 @@ if __name__ == "__main__":
             res = compute_edps(folder, case_id)
             results.append(res)
             
-            # 打印全部 EDP 及辅助时间信息
             print(f"  D_cum_3D = {res['D_cum_3D (m)']:.6e} m")
             print(f"  E_in     = {res['E_in (J)']:.6e} J")
             print(f"  D_w_peak = {res['D_w_peak (m)']:.6e} m")
@@ -295,17 +296,16 @@ if __name__ == "__main__":
     
     txt_path = "mesh_convergence_EDP_results.txt"
     with open(txt_path, "w") as f:
-        f.write("Mesh Convergence EDP Results\n")
+        f.write("Mesh Convergence EDP Results (with distributed mass, velocity-based R_VH)\n")
         f.write("=" * 70 + "\n")
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
         f.write("【计算说明】\n")
         f.write("1. 地震波固定为 MH1.txt, MH2.txt, combine.txt\n")
-        f.write("2. 质量分配：内部节点相同，顶部节点为内部的一半（匹配 Tcl）\n")
-        f.write("3. E_in 为梯形累积输入能量最大值\n")
-        f.write("4. D_w_peak 窗口基于各方向绝对功率之和（5%%-95%% 闭区间）\n")
-        f.write("5. R_VH 为全结构竖向动能 / 水平动能（质量加权速度平方积分）\n")
-        f.write("6. 加速度单位：请确认 ACCEL_IN_G 和 G_CONST 设置与地震波文件单位一致\n")
+        f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点为内部的一半（严格匹配 Tcl）\n")
+        f.write("3. E_in 为梯形累积输入能量绝对值最大值（分布质量）\n")
+        f.write("4. D_w_peak 窗口基于所有节点总功率绝对值（5%%-95%% 闭区间）\n")
+        f.write("5. R_VH 采用质量加权速度平方积分（动能比），符合论文定义\n")
     
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
