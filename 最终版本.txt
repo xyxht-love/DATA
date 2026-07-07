@@ -1,7 +1,7 @@
 # ====================================================
 # model_fixed_numEle10_stable.tcl
 # 竖直悬臂杆 - 三向月震输入，固定网格 numEle=10
-# 基于原始稳定模型，仅做必要修改（算法、阻尼、模态阶数）
+# 完全符合论文第4章论述：顶部集中质量3000kg，KrylovNewton算法
 # ====================================================
 
 wipe
@@ -85,24 +85,28 @@ set A   [expr {$pi * ($R_out**2 - $R_in**2)}]
 set Iy  [expr {$pi/64.0 * (pow($D,4) - pow($D-2*$t,4))}]
 set Iz  $Iy
 set J   [expr {2.0 * $Iy}]
-set m   [expr {$rho * $A * $L}]
+set m   [expr {$rho * $A * $L}]          ;# 杆件总质量
 
 set zeta 0.05
 
 # ====================================================
-# 5. 网格参数（固定 numEle=10）
+# 5. 网格参数（固定 numEle=10）与顶部集中质量
 # ====================================================
 set numEle 10
 set dz [expr {$L / $numEle}]
 set topNode [expr {$numEle + 1}]
-set mEle [expr {$m / $numEle}]
+set mEle [expr {$m / $numEle}]            ;# 每个单元杆件质量
+set M_add 3000.0                          ;# 顶部附加质量（上部设备）
 
-puts "\n========== 网格离散信息 =========="
+puts "\n========== 网格离散与质量信息 =========="
 puts "单元数量 numEle = $numEle"
 puts "单元长度 dz = [format %.4f $dz] m"
 puts "顶部节点编号 topNode = $topNode"
-puts "每个单元质量 mEle = [format %.4f $mEle] kg"
-puts "==================================="
+puts "杆件总质量 m = [format %.4f $m] kg"
+puts "每个单元杆件质量 mEle = [format %.4f $mEle] kg"
+puts "顶部附加质量 M_add = $M_add kg"
+puts "顶部节点总质量 = [format %.4f [expr {$M_add + $mEle/2.0}]] kg"
+puts "==========================================="
 
 # ====================================================
 # 6. 建模
@@ -116,11 +120,11 @@ for {set i 1} {$i <= $topNode} {incr i} {
 }
 fix 1 1 1 1 1 1
 
-# 集中质量分配（与原始模型完全一致）
+# 质量分配：中间节点仅杆件质量，顶部节点附加质量+半跨杆件质量
 for {set i 2} {$i < $topNode} {incr i} {
     mass $i $mEle $mEle $mEle 0 0 0
 }
-mass $topNode [expr {$mEle/2.0}] [expr {$mEle/2.0}] [expr {$mEle/2.0}] 0 0 0
+mass $topNode [expr {$M_add + $mEle/2.0}] [expr {$M_add + $mEle/2.0}] [expr {$M_add + $mEle/2.0}] 0 0 0
 
 # 几何变换
 geomTransf Linear 1 0 1 0
@@ -131,21 +135,21 @@ for {set i 1} {$i <= $numEle} {incr i} {
 }
 
 # ====================================================
-# 7. 重力分析（单步，使用 BandGeneral 与原始一致）
+# 7. 重力分析（荷载与质量一致）
 # ====================================================
 pattern Plain 10 Linear {
     for {set i 2} {$i < $topNode} {incr i} {
         load $i 0.0 0.0 [expr {-$mEle * $g_moon}] 0.0 0.0 0.0
     }
-    load $topNode 0.0 0.0 [expr {-$mEle/2.0 * $g_moon}] 0.0 0.0 0.0
+    load $topNode 0.0 0.0 [expr {-( $M_add + $mEle/2.0 ) * $g_moon}] 0.0 0.0 0.0
 }
 
 constraints Transformation
 numberer RCM
-system BandGeneral                ;# 与原始一致
+system BandGeneral
 test NormDispIncr $tolerance $maxIterations 0
 algorithm Newton
-integrator LoadControl 1.0        ;# 单步加载（更高效，也可改为0.1分10步）
+integrator LoadControl 1.0
 analysis Static
 set okGravity [analyze 1]
 
@@ -159,7 +163,7 @@ wipeAnalysis
 # 8. 模态分析（仅取前2阶，用于Rayleigh阻尼）
 # ====================================================
 set numModes 2
-set eigenValues [eigen -fullGenLapack $numModes]   ;# 使用稳健求解器
+set eigenValues [eigen -fullGenLapack $numModes]
 
 set omega1 0.0
 set omega2 0.0
@@ -178,7 +182,7 @@ for {set i 0} {$i < $numModes} {incr i} {
     }
 }
 
-# 特征周期识别（基于振型分量比例，保留原功能）
+# 特征周期识别（基于振型分量比例）
 puts "\n结构特征周期（振型方向识别）："
 for {set i 1} {$i <= $numModes} {incr i} {
     set lambda [lindex $eigenValues [expr {$i-1}]]
@@ -214,8 +218,8 @@ for {set i 1} {$i <= $numModes} {incr i} {
 # 若未识别，采用理论估算值
 set k_axial [expr {$E*$A/$L}]
 set k_bend  [expr {3.0*$E*$Iy/pow($L,3)}]
-if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt($m / $k_bend)}] }
-if {$T_vertical == 0.0}   { set T_vertical   [expr {2.0 * $pi * sqrt($m / $k_axial)}] }
+if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt(($m + $M_add) / $k_bend)}] }   ;# 计入顶部质量
+if {$T_vertical == 0.0}   { set T_vertical   [expr {2.0 * $pi * sqrt(($m + $M_add) / $k_axial)}] }
 
 # ====================================================
 # 9. Rayleigh 阻尼（修正参数顺序）
@@ -230,7 +234,6 @@ if {$omega1 > 0 && $omega2 > 0} {
     set alphaM 0.0
     set betaK  0.0
 }
-# ★ 关键修改：rayleigh 格式为 alphaM, betaK_current, betaK_initial, betaK_comm
 rayleigh $alphaM 0.0 0.0 $betaK
 
 # ====================================================
@@ -245,7 +248,7 @@ timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor $factorZ
 pattern UniformExcitation 3 3 -accel 3
 
 # ====================================================
-# 11. 输出记录器（所有质量节点，便于后处理）
+# 11. 输出记录器（所有质量节点）
 # ====================================================
 set outputDir "outputs_mesh_${numEle}"
 file mkdir $outputDir
@@ -260,22 +263,23 @@ set fp_period [open "$outputDir/structural_periods.txt" w]
 puts $fp_period "# 结构特征周期计算结果 (numEle = $numEle)"
 puts $fp_period "分析时间 = [clock format [clock seconds]]"
 puts $fp_period "单元数量 numEle = $numEle"
+puts $fp_period "顶部附加质量 M_add = $M_add kg"
 puts $fp_period "水平向特征周期 T_h = [format %.6f $T_horizontal] s"
 puts $fp_period "竖直向特征周期 T_v = [format %.6f $T_vertical] s"
 puts $fp_period "Rayleigh阻尼系数 alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
 close $fp_period
 
 # ====================================================
-# 12. 时程分析（算法改回 Newton，求解器 BandGeneral）
+# 12. 时程分析（KrylovNewton + 常加速度Newmark）
 # ====================================================
 puts "\n========== 时程分析 =========="
-set gamma 0.6
-set beta 0.3025
+set gamma 0.5
+set beta 0.25
 constraints Transformation
 numberer RCM
-system BandGeneral                ;# 与原始一致
+system BandGeneral
 test EnergyIncr $tolerance $maxIterations 0
-algorithm Newton                  ;# ★ 改为 Newton（更稳健）
+algorithm KrylovNewton                ;# 与论文一致
 integrator Newmark $gamma $beta
 analysis Transient
 
