@@ -21,18 +21,16 @@ proc countLines {filename} {
 }
 
 # ====================================================
-# 2. 固定地震波文件名（不修改）
+# 2. 固定地震波文件名
 # ====================================================
 set fileX "MH1.txt"
 set fileY "MH2.txt"
 set fileZ "combine.txt"
 
-# 检查文件是否存在
 if {![file exists $fileX]} { puts "错误：$fileX 不存在" ; exit 1 }
 if {![file exists $fileY]} { puts "错误：$fileY 不存在" ; exit 1 }
 if {![file exists $fileZ]} { puts "错误：$fileZ 不存在" ; exit 1 }
 
-# 读取时间步数（假设三个文件长度一致）
 set dt 0.01
 set nPointsX [countLines $fileX]
 set nPointsY [countLines $fileY]
@@ -67,13 +65,12 @@ set A_cross [expr {$pi * ($R_out**2 - $R_in**2)}]
 set Iy  [expr {$pi/64.0 * (pow($D,4) - pow($D-2*$t_wall,4))}]
 set Iz  $Iy
 set J   [expr {2.0 * $Iy}]
-set m_total [expr {$rho * $A_cross * $L}]   ;# 梁总质量
+set m_total [expr {$rho * $A_cross * $L}]
 
-# 阻尼比
 set zeta 0.05
 
 # ====================================================
-# 4. 网格数量列表（可根据需要修改）
+# 4. 网格数量列表
 # ====================================================
 set meshList {1 2 4 8 10 12 16}
 
@@ -87,14 +84,17 @@ foreach numEle $meshList {
     puts "================================================"
 
     set outputDir "outputs_mesh_${numEle}"
+
+    # ★★★ 修改1：强制删除旧目录，避免残留 ★★★
+    if {[file exists $outputDir]} {
+        file delete -force $outputDir
+    }
     file mkdir $outputDir
 
-    # ---- 5.1 计算网格相关参数 ----
     set dz [expr {$L / $numEle}]
     set topNode [expr {$numEle + 1}]
     set mEle [expr {$m_total / $numEle}]
 
-    # ---- 5.2 建模 ----
     model BasicBuilder -ndm 3 -ndf 6
 
     for {set i 1} {$i <= $topNode} {incr i} {
@@ -103,7 +103,6 @@ foreach numEle $meshList {
     }
     fix 1 1 1 1 1 1
 
-    # 质量分配（内部节点 mEle，顶部节点 mEle/2）
     for {set i 2} {$i < $topNode} {incr i} {
         mass $i $mEle $mEle $mEle 0 0 0
     }
@@ -114,7 +113,7 @@ foreach numEle $meshList {
         element elasticBeamColumn $i $i [expr {$i+1}] $A_cross $E $G $J $Iy $Iz 1
     }
 
-    # ---- 5.3 重力分析 ----
+    # ---- 重力分析 ----
     pattern Plain 10 Linear {
         for {set i 2} {$i < $topNode} {incr i} {
             load $i 0.0 0.0 [expr {-$mEle * $g_moon}] 0.0 0.0 0.0
@@ -131,7 +130,7 @@ foreach numEle $meshList {
     analyze 10
     wipeAnalysis
 
-    # ---- 5.4 模态分析 ----
+    # ---- 模态分析 ----
     set numModes 3
     set eigenValues [eigen $numModes]
     set omega1 0.0
@@ -155,7 +154,7 @@ foreach numEle $meshList {
     }
     rayleigh $alphaM 0.0 $betaK 0.0
 
-    # ---- 5.5 地震输入（使用固定文件） ----
+    # ---- 地震输入 ----
     remove loadPattern 10
     timeSeries Path 1 -dt $dt -filePath $fileX -column 2 -factor 1.0
     pattern UniformExcitation 1 1 -accel 1
@@ -164,18 +163,18 @@ foreach numEle $meshList {
     timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor 1.0
     pattern UniformExcitation 3 3 -accel 3
 
-    # ---- 5.6 ★★★ 输出所有质量节点（2 ~ topNode）★★★ ----
+    # ---- 输出所有质量节点 ----
     recorder Node -file "$outputDir/disp_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 disp
     recorder Node -file "$outputDir/vel_all.out"  -time -nodeRange 2 $topNode -dof 1 2 3 vel
 
-    # 可选：保存周期信息
+    # 周期信息
     set fp_period [open "$outputDir/structural_periods.txt" w]
     puts $fp_period "numEle = $numEle, topNode = $topNode"
     puts $fp_period "omega1 = [format %.4e $omega1], omega2 = [format %.4e $omega2]"
     puts $fp_period "alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
     close $fp_period
 
-    # ---- 5.7 时程分析 ----
+    # ---- 时程分析 ----
     puts "开始时程分析 numEle=$numEle ..."
     set gamma 0.6
     set beta 0.3025
@@ -198,7 +197,6 @@ foreach numEle $meshList {
             incr successfulSteps
         } else {
             incr failedSteps
-            # 失败时尝试减半步长
             set dt_half [expr {$dt / 2.0}]
             set ok2 [analyze 2 $dt_half]
             if {$ok2 == 0} {
@@ -214,6 +212,9 @@ foreach numEle $meshList {
     }
 
     puts "numEle=$numEle 分析完成: 成功=$successfulSteps, 失败=$failedSteps"
+
+    # ★★★ 修改2：显式移除 recorder 再 wipe ★★★
+    remove recorders
     wipe
 }
 
