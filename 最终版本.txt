@@ -444,6 +444,22 @@ if {[llength $beamForce] >= 6} {
     puts "Mz = [format %.3f [lindex $beamForce 5]] N·m"
 }
 
+# 1. 输出地面加速度 (节点1通常为固定端)
+recorder Node -file ground_accel.out -time -node 1 -dof 1 2 3 accel
+
+# 2. 输出模型关键参数 (用于 Python 自动读取)
+set fp [open model_info.txt w]
+puts $fp "numEle $numEle"
+puts $fp "M_add $M_add"
+puts $fp "BeamMass $BEAM_MASS"
+puts $fp "start_node 2"
+close $fp
+
+# 3. 输出结构周期 (确保特征值分析已执行)
+set fp [open structural_periods.txt w]
+puts $fp "T_h = [lindex $eigenvalues 0]"
+puts $fp "T_v = [lindex $eigenvalues 1]"
+close $fp
 puts ""
 puts "Output directory : $outputDir"
 puts "Model finished."
