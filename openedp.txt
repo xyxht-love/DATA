@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees EDP 后处理 (最终论文版 v3)
-- 严格匹配 Tcl 质量分配：包含顶部附加质量 M_ADD = 3000 kg
-- 修正质量缺失问题，恢复正确位移与能量量级
-- 其余 EDP 定义与论文完全一致
+OpenSees EDP 后处理 (最终科学版 Final Science)
+- 100% 由 Tcl Recorder 输出驱动，零硬编码参数
+- 地面加速度从 ground_accel.out 读取（不再依赖 MH1/MH2/combine）
+- 质量、节点数、几何参数从 model_info.txt 自动读取
+- 周期从 structural_periods.txt 自动读取
+- 严格保留 E_in / D_w_peak / R_VH 论文算法
 - 支持网格收敛分析 (outputs_mesh_*)
 """
 
@@ -15,29 +17,15 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# 用户可调参数
+# 用户可调参数（仅剩 EPS 和合理性阈值）
 # ============================================================
-ACCEL_IN_G = False          # 文件已为 m/s²，不做缩放
 EPS = 1.0e-12
-M_ADD = 3000.0              # ★★★ 顶部附加质量 (kg)，必须与 Tcl 中的 M_add 一致 ★★★
-
-# 结构几何与材料（用于计算梁总质量）
-D = 0.35
-t_wall = 0.035
-L = 4.5
-rho = 2700.0
-A_cross = np.pi * ((D/2)**2 - (D/2 - t_wall)**2)
-BEAM_MASS = rho * A_cross * L          # 杆总质量 (kg)
-
-# 固定地震波文件名（与 Tcl 一致）
-ACCEL_FILES = {
-    'X': "MH1.txt",
-    'Y': "MH2.txt",
-    'Z': "combine.txt"
-}
+MAX_DISP_WARN = 10.0        # m
+MAX_VEL_WARN = 10.0         # m/s
+MAX_ACCEL_WARN = 100.0      # m/s²
 
 # ============================================================
-# 读取函数
+# 读取函数（全部基于 Recorder）
 # ============================================================
 def read_all_nodes(filepath):
     """读取多节点输出文件，返回 (t, u) 形状 (nsteps, nnodes, 3)"""
@@ -48,32 +36,129 @@ def read_all_nodes(filepath):
         data = data.reshape(1, -1)
     t = data[:, 0]
     cols = data.shape[1] - 1
+    if cols % 3 != 0:
+        raise ValueError(f"{filepath} 列数不是 3 的倍数，无法解析节点")
     nnodes = cols // 3
     u = data[:, 1:].reshape(-1, nnodes, 3)
     return t, u
 
-def read_accel_file(fpath, dt_ref=0.01):
-    """读取加速度文件（第一列时间，第二列加速度），直接返回 m/s²"""
-    data = np.loadtxt(fpath)
+def read_ground_accel(filepath):
+    """
+    读取地面加速度文件 (由 Tcl Recorder 输出)
+    格式要求: 第一列时间，第二~四列分别为 agx, agy, agz (m/s²)
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"错误: 未找到地面加速度文件 {filepath}。\n"
+            "请在 Tcl 中添加: recorder Node -file ground_accel.out -time -node 1 -dof 1 2 3 accel"
+        )
+    data = np.loadtxt(filepath)
     if data.ndim == 1:
-        data = data.reshape(-1, 1)
-    if data.shape[1] == 1:
-        n = data.shape[0]
-        t = np.arange(n) * dt_ref
-        accel = data[:, 0]
-    else:
-        t = data[:, 0]
-        accel = data[:, 1]
-    if ACCEL_IN_G:
-        accel = accel * G_CONST
-    return t, accel
+        data = data.reshape(1, -1)
+    if data.shape[1] < 4:
+        raise ValueError(f"ground_accel.out 列数不足 (需要 时间+3个方向), 实际为 {data.shape[1]}")
+    t = data[:, 0]
+    ag_x = data[:, 1]
+    ag_y = data[:, 2]
+    ag_z = data[:, 3]
+    return t, ag_x, ag_y, ag_z
+
+def read_model_info(filepath="model_info.txt"):
+    """
+    读取模型信息文件 (由 Tcl 输出)
+    必须包含: numEle, M_add, BeamMass, start_node (起始质量节点编号)
+    示例格式:
+        numEle 10
+        M_add 3000.0
+        BeamMass 123.456
+        start_node 2
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"错误: 未找到模型信息文件 {filepath}。\n"
+            "请在 Tcl 中输出必要参数，例如: \n"
+            "set fp [open model_info.txt w]\n"
+            "puts $fp \"numEle $numEle\"\n"
+            "puts $fp \"M_add $M_add\"\n"
+            "puts $fp \"BeamMass $BEAM_MASS\"\n"
+            "puts $fp \"start_node 2\"\n"
+            "close $fp"
+        )
+    params = {}
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = re.split(r'\s+', line)
+            if len(parts) >= 2:
+                key = parts[0]
+                try:
+                    params[key] = float(parts[1])
+                except ValueError:
+                    params[key] = parts[1]  # 保留字符串以防万一
+    # 类型转换
+    required_keys = ['numEle', 'M_add', 'BeamMass', 'start_node']
+    for k in required_keys:
+        if k not in params:
+            raise ValueError(f"model_info.txt 缺少必要字段: {k}")
+        if k in ['numEle', 'start_node']:
+            params[k] = int(params[k])
+        else:
+            params[k] = float(params[k])
+    return params
+
+def read_structural_periods(filepath="structural_periods.txt"):
+    """
+    读取结构周期文件 (由 Tcl 输出)
+    支持两种格式:
+      1. "T_h = 0.4762" 和 "T_v = 0.0124" (带等号)
+      2. 两行纯数字: 第一行 Th, 第二行 Tv
+    """
+    if not os.path.exists(filepath):
+        print(f"   ⚠️ 未找到周期文件 {filepath}，周期设为 NaN")
+        return np.nan, np.nan
+    Th, Tv = np.nan, np.nan
+    with open(filepath, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    if not lines:
+        return Th, Tv
+
+    # 尝试解析键值对
+    for line in lines:
+        if '=' in line:
+            key, val = line.split('=', 1)
+            key = key.strip().lower()
+            val = val.strip()
+            try:
+                if 't_h' in key or 'th' in key:
+                    Th = float(val)
+                elif 't_v' in key or 'tv' in key:
+                    Tv = float(val)
+            except:
+                pass
+    # 如果没有等号，尝试按两行数字读取
+    if np.isnan(Th) and np.isnan(Tv):
+        try:
+            vals = []
+            for line in lines:
+                # 提取行中第一个数字
+                num = re.search(r'[-+]?\d*\.?\d+', line)
+                if num:
+                    vals.append(float(num.group()))
+            if len(vals) >= 1:
+                Th = vals[0]
+            if len(vals) >= 2:
+                Tv = vals[1]
+        except:
+            pass
+    return Th, Tv
 
 def get_node_masses(n_mass_nodes, beam_mass, add_mass):
     """
     严格匹配 Tcl 质量分配：
     - 内部节点 (n-1) 个：质量 = beam_mass / n
     - 顶部节点 (最后一个)：质量 = add_mass + 0.5 * beam_mass / n
-    实际总质量 = add_mass + (n - 0.5) * beam_mass / n
     """
     if n_mass_nodes <= 1:
         return np.array([add_mass + beam_mass])
@@ -82,45 +167,84 @@ def get_node_masses(n_mass_nodes, beam_mass, add_mass):
     masses[-1] = add_mass + 0.5 * m_internal
     return masses
 
+def check_consistency(t_disp, t_vel, t_accel, tol=1e-6):
+    """检查时间轴是否一致"""
+    if not np.allclose(t_disp, t_vel, atol=tol):
+        raise ValueError("位移与速度时间轴不一致")
+    if t_accel is not None and not np.allclose(t_disp, t_accel, atol=tol):
+        raise ValueError("位移与加速度时间轴不一致")
+    return True
+
+def check_reasonable_values(disp_max, vel_max, accel_max):
+    """检查最大响应是否在合理范围内"""
+    if disp_max > MAX_DISP_WARN:
+        print(f"   ⚠️ 最大位移 {disp_max:.2f} m 超出合理范围 (> {MAX_DISP_WARN} m)")
+    if vel_max > MAX_VEL_WARN:
+        print(f"   ⚠️ 最大速度 {vel_max:.2f} m/s 超出合理范围 (> {MAX_VEL_WARN} m/s)")
+    if accel_max > MAX_ACCEL_WARN:
+        print(f"   ⚠️ 最大加速度 {accel_max:.2f} m/s² 超出合理范围 (> {MAX_ACCEL_WARN} m/s²)")
+
 # ============================================================
 # EDP 计算核心
 # ============================================================
 def compute_edps(folder_path, case_id):
+    # 1. 定义所有文件路径
     disp_path = os.path.join(folder_path, "disp_all.out")
-    vel_path  = os.path.join(folder_path, "vel_all.out")
+    vel_path = os.path.join(folder_path, "vel_all.out")
+    accel_path = os.path.join(folder_path, "accel_all.out")
+    ground_accel_path = os.path.join(folder_path, "ground_accel.out")
+    model_info_path = os.path.join(folder_path, "model_info.txt")
+    period_path = os.path.join(folder_path, "structural_periods.txt")
 
+    # 2. 读取模型信息 (获取 numEle, M_add, BeamMass, start_node)
+    model_params = read_model_info(model_info_path)
+    numEle = model_params['numEle']
+    M_ADD = model_params['M_add']
+    BEAM_MASS = model_params['BeamMass']
+    start_node = model_params['start_node']  # 通常为 2
+    print(f"   📋 读取模型信息: numEle={numEle}, M_add={M_ADD:.2f} kg, BeamMass={BEAM_MASS:.2f} kg")
+
+    # 3. 读取地面加速度 (来自 Recorder)
+    t_g, ag_x, ag_y, ag_z = read_ground_accel(ground_accel_path)
+
+    # 4. 读取位移、速度、加速度响应
     t, disp = read_all_nodes(disp_path)
     t_vel, vel = read_all_nodes(vel_path)
-    if not np.allclose(t, t_vel):
-        raise ValueError("位移与速度时间轴不一致！")
+    t_accel = None
+    accel = None
+    if os.path.exists(accel_path):
+        t_accel, accel = read_all_nodes(accel_path)
+    else:
+        print("   ⚠️ 未找到 accel_all.out，跳过加速度一致性检查")
 
+    # 5. 数据一致性检查 (节点数与时间轴)
+    check_consistency(t, t_vel, t_accel)
     dt = np.mean(np.diff(t))
     nt = len(t)
-    nnodes = disp.shape[1]          # 质量节点数（=numEle）
-    print(f"   读取: {nt} 步, dt = {dt:.6f} s, 质量节点数 = {nnodes}")
+    nnodes_disp = disp.shape[1]
+    nnodes_vel = vel.shape[1]
 
-    # 提取 numEle 并核对
-    try:
-        numEle = int(case_id.split("_")[1]) if "_" in case_id else None
-        if numEle is not None and nnodes != numEle:
-            print(f"   ⚠️ 警告：输出节点数 {nnodes} 与理论 numEle {numEle} 不一致")
-    except:
-        pass
+    # 节点数检查：质量节点数必须等于 numEle
+    if nnodes_disp != numEle:
+        raise ValueError(f"位移输出节点数 ({nnodes_disp}) 与 model_info 中的 numEle ({numEle}) 不一致！")
+    if nnodes_vel != numEle:
+        raise ValueError(f"速度输出节点数 ({nnodes_vel}) 与 model_info 中的 numEle ({numEle}) 不一致！")
+    if accel is not None and accel.shape[1] != numEle:
+        raise ValueError(f"加速度输出节点数 ({accel.shape[1]}) 与 numEle ({numEle}) 不一致！")
 
-    # ★★★ 质量分配（包含顶部附加质量）★★★
-    masses = get_node_masses(nnodes, BEAM_MASS, M_ADD)
-    total_mass = np.sum(masses)          # 实际动力质量 = M_ADD + (nnodes-0.5)*BEAM_MASS/nnodes
+    # 6. 地面加速度插值到结构响应时间轴（确保时间对齐）
+    if not np.allclose(t, t_g, atol=1e-4):
+        print(f"   ⚠️ 地面加速度时间轴与结构响应不一致，正在进行线性插值...")
+        ag_x = np.interp(t, t_g, ag_x)
+        ag_y = np.interp(t, t_g, ag_y)
+        ag_z = np.interp(t, t_g, ag_z)
+
+    # 7. 质量分配
+    masses = get_node_masses(numEle, BEAM_MASS, M_ADD)
+    total_mass = np.sum(masses)
     print(f"   节点质量总和 = {total_mass:.2f} kg (梁 {BEAM_MASS:.2f} + 附加 {M_ADD:.2f})")
 
-    # 读取地震波并插值
-    t_x, ax = read_accel_file(ACCEL_FILES['X'], dt)
-    t_y, ay = read_accel_file(ACCEL_FILES['Y'], dt)
-    t_z, az = read_accel_file(ACCEL_FILES['Z'], dt)
-    ag_x = np.interp(t, t_x, ax)
-    ag_y = np.interp(t, t_y, ay)
-    ag_z = np.interp(t, t_z, az)
-
-    # ---- 提取顶部节点（最后一个） ----
+    # 8. 提取顶部节点（最后一个质量节点）
     top_idx = -1
     ux_top = disp[:, top_idx, 0]
     uy_top = disp[:, top_idx, 1]
@@ -128,7 +252,6 @@ def compute_edps(folder_path, case_id):
     vx_top = vel[:, top_idx, 0]
     vy_top = vel[:, top_idx, 1]
     vz_top = vel[:, top_idx, 2]
-
     disp_3d_top = np.sqrt(ux_top**2 + uy_top**2 + uz_top**2)
 
     # ----- EDP 1: D_cum_3D (顶部节点三维累计位移) -----
@@ -136,7 +259,7 @@ def compute_edps(folder_path, case_id):
 
     # ----- EDP 2: E_in (分布质量，梯形累积，取绝对值最大值) -----
     power_sum = np.zeros(nt)
-    for i in range(nnodes):
+    for i in range(numEle):
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
         vz = vel[:, i, 2]
@@ -148,7 +271,7 @@ def compute_edps(folder_path, case_id):
 
     # ----- EDP 3: D_w_peak (窗口基于各节点绝对功率之和) -----
     abs_power = np.zeros(nt)
-    for i in range(nnodes):
+    for i in range(numEle):
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
         vz = vel[:, i, 2]
@@ -174,7 +297,7 @@ def compute_edps(folder_path, case_id):
     # ----- EDP 5: R_VH (质量加权速度平方积分，动能比) -----
     int_vz2 = 0.0
     int_vh2 = 0.0
-    for i in range(nnodes):
+    for i in range(numEle):
         vz = vel[:, i, 2]
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
@@ -189,15 +312,44 @@ def compute_edps(folder_path, case_id):
     idx_max_uz = np.argmax(np.abs(uz_top))
     t_max_uz = t[idx_max_uz]
 
-    # ---- 节点峰值检查 (用于验证输出) ----
-    print("  节点峰值三维位移检查 (从第2个节点开始):")
-    for i in range(nnodes):
+    # ---- 节点峰值检查 (动态显示真实节点编号) ----
+    print(f"  节点峰值三维位移检查 (真实节点编号 {start_node}~{start_node+numEle-1}):")
+    for i in range(numEle):
         d = np.sqrt(disp[:, i, 0]**2 + disp[:, i, 1]**2 + disp[:, i, 2]**2)
-        print(f"    node{i+2:3d}: {np.max(d):.4e} m")
+        real_node = start_node + i
+        print(f"    node{real_node:3d}: {np.max(d):.4e} m")
 
+    # ---- 响应幅值合理性检查 ----
+    max_disp = np.max(np.sqrt(disp[:, :, 0]**2 + disp[:, :, 1]**2 + disp[:, :, 2]**2))
+    max_vel = np.max(np.sqrt(vel[:, :, 0]**2 + vel[:, :, 1]**2 + vel[:, :, 2]**2))
+    max_accel = 0.0
+    if accel is not None:
+        max_accel = np.max(np.sqrt(accel[:, :, 0]**2 + accel[:, :, 1]**2 + accel[:, :, 2]**2))
+    check_reasonable_values(max_disp, max_vel, max_accel)
+
+    # ---- EDP 合理性检查 ----
+    if D_3D_max < 1e-10:
+        print("   ⚠️ D_3D_max 接近零，请检查模型是否正常振动")
+    if E_in < 0:
+        print("   ⚠️ E_in 为负，请检查功率计算符号")
+
+    # ---- 读取结构周期 ----
+    Th, Tv = read_structural_periods(period_path)
+    if not np.isnan(Th):
+        print(f"   水平周期 Th = {Th:.4f} s")
+    if not np.isnan(Tv):
+        print(f"   竖向周期 Tv = {Tv:.4f} s")
+
+    # ---- 返回结果 ----
     return {
         "Case": case_id,
         "Folder": os.path.basename(folder_path),
+        "numEle": numEle,
+        "BeamMass (kg)": BEAM_MASS,
+        "TopMass (kg)": M_ADD,
+        "TotalMass (kg)": total_mass,
+        "Th (s)": Th,
+        "Tv (s)": Tv,
         "D_cum_3D (m·s)": D_cum_3D,
         "E_in (J)": E_in,
         "D_w_peak (m)": D_w_peak,
@@ -209,14 +361,11 @@ def compute_edps(folder_path, case_id):
         "t@maxUz (s)": t_max_uz,
         "max|Uz| (m)": max_uz,
         "max|Uh| (m)": max_h,
-        "总质量(动力) (kg)": total_mass,
-        "梁质量 (kg)": BEAM_MASS,
-        "附加质量 (kg)": M_ADD,
-        "步长 dt (s)": dt,
+        "dt (s)": dt,
     }
 
 # ============================================================
-# 主程序：自动搜索并批量处理
+# 主程序
 # ============================================================
 def find_folders():
     folders = []
@@ -237,9 +386,11 @@ def extract_case_id(folder_name):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  OpenSees EDP 后处理 (最终论文版 v3 - 修正质量)")
+    print("  OpenSees EDP 后处理 (最终科学版 Final Science)")
+    print("  全部数据由 Recorder 驱动，零硬编码参数")
     print("=" * 70)
 
+    # 检查当前目录是否存在必需的 model_info.txt 模板？不强制，只在各子文件夹检查
     folders = find_folders()
     if not folders:
         print("❌ 未找到任何 outputs_mesh_* 文件夹！")
@@ -263,8 +414,6 @@ if __name__ == "__main__":
             print(f"  D_3D_max = {res['D_3D_max (m)']:.6e} m")
             print(f"  R_VH     = {res['R_VH (-)']:.6e}")
             print(f"  持时窗口: t5 = {res['t5 (s)']:.3f} s, t95 = {res['t95 (s)']:.3f} s")
-            print(f"  D_3D_max 发生时刻: t = {res['t@D3Dmax (s)']:.3f} s")
-            print(f"  max|Uz| 发生时刻: t = {res['t@maxUz (s)']:.3f} s")
         except Exception as e:
             print(f"  ❌ 处理失败: {e}")
 
@@ -272,24 +421,27 @@ if __name__ == "__main__":
         sys.exit(1)
 
     df = pd.DataFrame(results)
-    csv_path = "mesh_convergence_EDP_final_v3.csv"
+    csv_path = "mesh_convergence_EDP_FinalScience.csv"
     df.to_csv(csv_path, index=False, float_format="%.6e")
 
-    txt_path = "mesh_convergence_EDP_final_v3.txt"
+    txt_path = "mesh_convergence_EDP_FinalScience.txt"
     with open(txt_path, "w") as f:
-        f.write("Mesh Convergence EDP Results (Final v3, corrected mass with M_ADD=3000 kg)\n")
+        f.write("Mesh Convergence EDP Results (Final Science)\n")
         f.write("=" * 70 + "\n")
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
-        f.write("【计算说明】\n")
-        f.write("1. 地震波为 m/s²，不缩放 (ACCEL_IN_G=False)\n")
-        f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点 M_ADD + 0.5*beam_mass/numEle\n")
-        f.write("3. E_in 为梯形累积输入能量绝对值最大值（分布质量）\n")
-        f.write("4. D_w_peak 窗口基于各节点绝对功率之和（5%-95% 闭区间）\n")
-        f.write("5. R_VH 采用质量加权速度平方积分（动能比）\n")
-        f.write("6. 顶部节点取最后一个质量节点（索引 -1）\n")
-        f.write(f"7. 顶部附加质量 M_ADD = {M_ADD} kg\n")
+        f.write("【Final Science 说明】\n")
+        f.write("1. 地面加速度来源于 ground_accel.out (Recorder输出)，不再读取外部 MH1/MH2/combine\n")
+        f.write("2. 模型参数 (numEle, M_add, BeamMass, start_node) 来源于 model_info.txt\n")
+        f.write("3. 周期 T_h, T_v 来源于 structural_periods.txt\n")
+        f.write("4. 质量分配：内部节点 beam_mass/numEle，顶部节点 M_ADD + 0.5*beam_mass/numEle\n")
+        f.write("5. E_in 为梯形累积输入能量绝对值最大值（分布质量）\n")
+        f.write("6. D_w_peak 窗口基于各节点绝对功率之和（5%-95% 闭区间）\n")
+        f.write("7. R_VH 采用质量加权速度平方积分（动能比）\n")
+        f.write("8. 增加了 disp/vel/accel 节点数与时间轴一致性检查\n")
+        f.write("9. 增加了响应幅值合理性检查\n")
 
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
     print(f"   - {txt_path}")
+    print("\n🎯 此版本为 100% 由 Tcl 驱动的最终科学版 (Final Science)。")
