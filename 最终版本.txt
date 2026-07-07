@@ -1,12 +1,20 @@
 # ====================================================
-# MODIFIED_TCL_FOR_MESH_CONVERGENCE.tcl
-# 竖直悬臂杆 - 三向月震输入，输出所有节点，支持不同网格数
+# model_fixed_numEle10.tcl
+# 竖直悬臂杆 - 三向月震输入，固定网格 numEle=10
+# 基于原模型优化，提升数值稳定性
 # ====================================================
 
 wipe
 
 # ====================================================
-# 1. 工具函数：统计行数
+# 0. 全局分析控制参数
+# ====================================================
+set tolerance 1.0e-8
+set maxIterations 100
+set printInterval 100000          ;# 进度打印间隔（步数）
+
+# ====================================================
+# 1. 工具函数：统计文件行数
 # ====================================================
 proc countLines {filename} {
     set count 0
@@ -21,201 +29,307 @@ proc countLines {filename} {
 }
 
 # ====================================================
-# 2. 固定地震波文件名
+# 2. 固定地震波文件
 # ====================================================
+set dt 0.01
 set fileX "MH1.txt"
 set fileY "MH2.txt"
 set fileZ "combine.txt"
 
-if {![file exists $fileX]} { puts "错误：$fileX 不存在" ; exit 1 }
-if {![file exists $fileY]} { puts "错误：$fileY 不存在" ; exit 1 }
-if {![file exists $fileZ]} { puts "错误：$fileZ 不存在" ; exit 1 }
+if {![file exists $fileX]} { puts "错误：$fileX 不存在！" ; exit 1 }
+if {![file exists $fileY]} { puts "错误：$fileY 不存在！" ; exit 1 }
+if {![file exists $fileZ]} { puts "错误：$fileZ 不存在！" ; exit 1 }
 
-set dt 0.01
 set nPointsX [countLines $fileX]
 set nPointsY [countLines $fileY]
 set nPointsZ [countLines $fileZ]
 set nPoints [expr {min($nPointsX, min($nPointsY, $nPointsZ))}]
 set totalTime [expr {$nPoints * $dt}]
 
-puts "地震记录信息："
-puts "  X: $fileX, 点数 = $nPointsX"
-puts "  Y: $fileY, 点数 = $nPointsY"
-puts "  Z: $fileZ, 点数 = $nPointsZ"
-puts "  分析步数 = $nPoints, dt = $dt s, 总时长 = [format %.2f $totalTime] s"
+puts "========== 地震记录信息 =========="
+puts "X向文件: $fileX, 点数: $nPointsX"
+puts "Y向文件: $fileY, 点数: $nPointsY"
+puts "Z向文件: $fileZ, 点数: $nPointsZ"
+puts "分析步数: $nPoints 步"
+puts "时间步长: $dt 秒"
+puts "总时长: [format %.2f $totalTime] 秒"
+puts "================================="
 
 # ====================================================
-# 3. 结构参数（固定）
+# 3. 三向输入因子（均为1.0）
+# ====================================================
+set factorX 1.0
+set factorY 1.0
+set factorZ 1.0
+
+# ====================================================
+# 4. 结构物理参数（固定）
 # ====================================================
 set g_earth 9.81
 set g_moon 1.62
+
 set E 69.0e9
 set nu 0.33
 set rho 2700.0
 set G 26.0e9
 set fy 276.0e6
+
 set L 4.5
 set D 0.35
-set t_wall 0.035
-set pi 3.141592653589793
+set t 0.035
 
 set R_out [expr {$D/2.0}]
-set R_in  [expr {$R_out - $t_wall}]
-set A_cross [expr {$pi * ($R_out**2 - $R_in**2)}]
-set Iy  [expr {$pi/64.0 * (pow($D,4) - pow($D-2*$t_wall,4))}]
+set R_in  [expr {$R_out - $t}]
+set pi 3.141592653589793
+set A   [expr {$pi * ($R_out**2 - $R_in**2)}]
+set Iy  [expr {$pi/64.0 * (pow($D,4) - pow($D-2*$t,4))}]
 set Iz  $Iy
 set J   [expr {2.0 * $Iy}]
-set m_total [expr {$rho * $A_cross * $L}]
+set m   [expr {$rho * $A * $L}]
 
 set zeta 0.05
 
 # ====================================================
-# 4. 网格数量列表
+# 5. 网格参数（固定 numEle=10）
 # ====================================================
-set meshList {1 2 4 8 10 12 16}
+set numEle 10
+set dz [expr {$L / $numEle}]
+set topNode [expr {$numEle + 1}]
+set mEle [expr {$m / $numEle}]
+
+puts "\n========== 网格离散信息 =========="
+puts "单元数量 numEle = $numEle"
+puts "单元长度 dz = [format %.4f $dz] m"
+puts "顶部节点编号 topNode = $topNode"
+puts "每个单元质量 mEle = [format %.4f $mEle] kg"
+puts "==================================="
 
 # ====================================================
-# 5. 主循环：对每个网格数
+# 6. 建模
 # ====================================================
-foreach numEle $meshList {
+model BasicBuilder -ndm 3 -ndf 6
 
-    puts "\n================================================"
-    puts "开始处理网格数 numEle = $numEle"
-    puts "================================================"
+# 节点生成
+for {set i 1} {$i <= $topNode} {incr i} {
+    set z [expr {($i - 1) * $dz}]
+    node $i 0.0 0.0 $z
+}
+fix 1 1 1 1 1 1
 
-    set outputDir "outputs_mesh_${numEle}"
+# 集中质量分配
+for {set i 2} {$i < $topNode} {incr i} {
+    mass $i $mEle $mEle $mEle 0 0 0
+}
+mass $topNode [expr {$mEle/2.0}] [expr {$mEle/2.0}] [expr {$mEle/2.0}] 0 0 0
 
-    # ★★★ 修改1：强制删除旧目录，避免残留 ★★★
-    if {[file exists $outputDir]} {
-        file delete -force $outputDir
-    }
-    file mkdir $outputDir
+# 几何变换
+geomTransf Linear 1 0 1 0
 
-    set dz [expr {$L / $numEle}]
-    set topNode [expr {$numEle + 1}]
-    set mEle [expr {$m_total / $numEle}]
-
-    model BasicBuilder -ndm 3 -ndf 6
-
-    for {set i 1} {$i <= $topNode} {incr i} {
-        set z [expr {($i - 1) * $dz}]
-        node $i 0.0 0.0 $z
-    }
-    fix 1 1 1 1 1 1
-
-    for {set i 2} {$i < $topNode} {incr i} {
-        mass $i $mEle $mEle $mEle 0 0 0
-    }
-    mass $topNode [expr {$mEle/2.0}] [expr {$mEle/2.0}] [expr {$mEle/2.0}] 0 0 0
-
-    geomTransf Linear 1 0 1 0
-    for {set i 1} {$i <= $numEle} {incr i} {
-        element elasticBeamColumn $i $i [expr {$i+1}] $A_cross $E $G $J $Iy $Iz 1
-    }
-
-    # ---- 重力分析 ----
-    pattern Plain 10 Linear {
-        for {set i 2} {$i < $topNode} {incr i} {
-            load $i 0.0 0.0 [expr {-$mEle * $g_moon}] 0.0 0.0 0.0
-        }
-        load $topNode 0.0 0.0 [expr {-$mEle/2.0 * $g_moon}] 0.0 0.0 0.0
-    }
-    constraints Transformation
-    numberer RCM
-    system BandGeneral
-    test NormDispIncr 1.0e-8 100 0
-    algorithm Newton
-    integrator LoadControl 0.1
-    analysis Static
-    analyze 10
-    wipeAnalysis
-
-    # ---- 模态分析 ----
-    set numModes 3
-    set eigenValues [eigen $numModes]
-    set omega1 0.0
-    set omega2 0.0
-    for {set i 0} {$i < $numModes} {incr i} {
-        set lambda [lindex $eigenValues $i]
-        if {$lambda > 0} {
-            if {$i == 0} { set omega1 [expr {sqrt($lambda)}] }
-            if {$i == 1} { set omega2 [expr {sqrt($lambda)}] }
-        }
-    }
-    if {$omega1 > 0 && $omega2 > 0} {
-        set alphaM [expr {2.0 * $zeta * $omega1 * $omega2 / ($omega1 + $omega2)}]
-        set betaK  [expr {2.0 * $zeta / ($omega1 + $omega2)}]
-    } elseif {$omega1 > 0} {
-        set alphaM 0.0
-        set betaK  [expr {2.0 * $zeta / $omega1}]
-    } else {
-        set alphaM 0.0
-        set betaK  0.0
-    }
-    rayleigh $alphaM 0.0 $betaK 0.0
-
-    # ---- 地震输入 ----
-    remove loadPattern 10
-    timeSeries Path 1 -dt $dt -filePath $fileX -column 2 -factor 1.0
-    pattern UniformExcitation 1 1 -accel 1
-    timeSeries Path 2 -dt $dt -filePath $fileY -column 2 -factor 1.0
-    pattern UniformExcitation 2 2 -accel 2
-    timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor 1.0
-    pattern UniformExcitation 3 3 -accel 3
-
-    # ---- 输出所有质量节点 ----
-    recorder Node -file "$outputDir/disp_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 disp
-    recorder Node -file "$outputDir/vel_all.out"  -time -nodeRange 2 $topNode -dof 1 2 3 vel
-
-    # 周期信息
-    set fp_period [open "$outputDir/structural_periods.txt" w]
-    puts $fp_period "numEle = $numEle, topNode = $topNode"
-    puts $fp_period "omega1 = [format %.4e $omega1], omega2 = [format %.4e $omega2]"
-    puts $fp_period "alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
-    close $fp_period
-
-    # ---- 时程分析 ----
-    puts "开始时程分析 numEle=$numEle ..."
-    set gamma 0.6
-    set beta 0.3025
-    constraints Transformation
-    numberer RCM
-    system BandGeneral
-    test EnergyIncr 1.0e-8 100 0
-    algorithm KrylovNewton
-    integrator Newmark $gamma $beta
-    analysis Transient
-
-    set step 0
-    set successfulSteps 0
-    set failedSteps 0
-
-    while {$step < $nPoints} {
-        incr step
-        set ok [analyze 1 $dt]
-        if {$ok == 0} {
-            incr successfulSteps
-        } else {
-            incr failedSteps
-            set dt_half [expr {$dt / 2.0}]
-            set ok2 [analyze 2 $dt_half]
-            if {$ok2 == 0} {
-                incr successfulSteps
-                incr step
-            } else {
-                puts "警告：numEle=$numEle 步 $step 失败，跳过"
-            }
-        }
-        if {$step % 10000 == 0} {
-            puts "  进度: $step / $nPoints, 成功=$successfulSteps, 失败=$failedSteps"
-        }
-    }
-
-    puts "numEle=$numEle 分析完成: 成功=$successfulSteps, 失败=$failedSteps"
-
-    # ★★★ 修改2：显式移除 recorder 再 wipe ★★★
-    remove recorders
-    wipe
+# 弹性梁柱单元
+for {set i 1} {$i <= $numEle} {incr i} {
+    element elasticBeamColumn $i $i [expr {$i+1}] $A $E $G $J $Iy $Iz 1
 }
 
-puts "\n所有网格数处理完成！"
+# ====================================================
+# 7. 重力分析（单步，使用 SparseGeneral）
+# ====================================================
+pattern Plain 10 Linear {
+    for {set i 2} {$i < $topNode} {incr i} {
+        load $i 0.0 0.0 [expr {-$mEle * $g_moon}] 0.0 0.0 0.0
+    }
+    load $topNode 0.0 0.0 [expr {-$mEle/2.0 * $g_moon}] 0.0 0.0 0.0
+}
+
+constraints Transformation
+numberer RCM
+system SparseGeneral          ;# 更稳健
+test NormDispIncr $tolerance $maxIterations 0
+algorithm Newton
+integrator LoadControl 1.0    ;# 单步加载
+analysis Static
+set okGravity [analyze 1]
+
+if {$okGravity != 0} {
+    puts "重力分析失败，退出！"
+    exit 1
+}
+wipeAnalysis
+
+# ====================================================
+# 8. 模态分析与特征周期识别
+# ====================================================
+set numModes 3
+set eigenValues [eigen -fullGenLapack $numModes]   ;# 指定稳健求解器
+
+set omega1 0.0
+set omega2 0.0
+set T_horizontal 0.0
+set T_vertical 0.0
+
+puts "\n========== 模态分析 =========="
+for {set i 0} {$i < $numModes} {incr i} {
+    set lambda [lindex $eigenValues $i]
+    if {$lambda > 0} {
+        set freq [expr {sqrt($lambda)/(2.0*$pi)}]
+        set period [expr {1.0/$freq}]
+        puts "模态 [expr {$i+1}]: f=[format %.4f $freq] Hz, T=[format %.4f $period] s"
+        if {$i == 0} { set omega1 [expr {sqrt($lambda)}] }
+        if {$i == 1} { set omega2 [expr {sqrt($lambda)}] }
+    }
+}
+
+# 特征周期识别（基于振型分量比例）
+puts "\n结构特征周期（振型方向识别）："
+for {set i 1} {$i <= $numModes} {incr i} {
+    set lambda [lindex $eigenValues [expr {$i-1}]]
+    if {$lambda > 0} {
+        set period [expr {2.0 * $pi / sqrt($lambda)}]
+        set ux [nodeEigenvector $topNode $i 1]
+        set uy [nodeEigenvector $topNode $i 2]
+        set uz [nodeEigenvector $topNode $i 3]
+        set abs_ux [expr {abs($ux)}]
+        set abs_uy [expr {abs($uy)}]
+        set abs_uz [expr {abs($uz)}]
+        set sum [expr {$abs_ux + $abs_uy + $abs_uz}]
+        if {$sum > 1e-12} {
+            set ux_ratio [expr {$abs_ux / $sum}]
+            set uy_ratio [expr {$abs_uy / $sum}]
+            set uz_ratio [expr {$abs_uz / $sum}]
+            set max_ratio [expr {max($ux_ratio, $uy_ratio, $uz_ratio)}]
+            set direction "耦合"
+            if {$ux_ratio == $max_ratio} { set direction "X (水平)" }
+            if {$uy_ratio == $max_ratio} { set direction "Y (水平)" }
+            if {$uz_ratio == $max_ratio} { set direction "Z (竖向)" }
+            if {$max_ratio < 0.6} { set direction "耦合 (平动为主)" }
+            puts "模态 $i: 主方向 $direction, 最大比例 [format %.3f $max_ratio], T=[format %.6f $period] s"
+            if {$direction == "X (水平)" || $direction == "Y (水平)"} {
+                if {$T_horizontal == 0.0} { set T_horizontal $period }
+            } elseif {$direction == "Z (竖向)"} {
+                if {$T_vertical == 0.0} { set T_vertical $period }
+            }
+        }
+    }
+}
+
+# 若未识别，采用理论估算值
+set k_axial [expr {$E*$A/$L}]
+set k_bend  [expr {3.0*$E*$Iy/pow($L,3)}]
+if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt($m / $k_bend)}] }
+if {$T_vertical == 0.0}   { set T_vertical   [expr {2.0 * $pi * sqrt($m / $k_axial)}] }
+
+# ====================================================
+# 9. Rayleigh 阻尼
+# ====================================================
+if {$omega1 > 0 && $omega2 > 0} {
+    set alphaM [expr {2.0 * $zeta * $omega1 * $omega2 / ($omega1 + $omega2)}]
+    set betaK  [expr {2.0 * $zeta / ($omega1 + $omega2)}]
+} elseif {$omega1 > 0} {
+    set alphaM 0.0
+    set betaK  [expr {2.0 * $zeta / $omega1}]
+} else {
+    set alphaM 0.0
+    set betaK  0.0
+}
+rayleigh $alphaM 0.0 $betaK 0.0
+
+# ====================================================
+# 10. 地震输入
+# ====================================================
+remove loadPattern 10
+timeSeries Path 1 -dt $dt -filePath $fileX -column 2 -factor $factorX
+pattern UniformExcitation 1 1 -accel 1
+timeSeries Path 2 -dt $dt -filePath $fileY -column 2 -factor $factorY
+pattern UniformExcitation 2 2 -accel 2
+timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor $factorZ
+pattern UniformExcitation 3 3 -accel 3
+
+# ====================================================
+# 11. 输出记录器（所有节点）
+# ====================================================
+set outputDir "outputs_mesh_${numEle}"
+file mkdir $outputDir
+
+recorder Node -file "$outputDir/disp_all.out"  -time -nodeRange 2 $topNode -dof 1 2 3 disp
+recorder Node -file "$outputDir/vel_all.out"   -time -nodeRange 2 $topNode -dof 1 2 3 vel
+recorder Node -file "$outputDir/accel_all.out" -time -nodeRange 2 $topNode -dof 1 2 3 accel
+recorder Element -file "$outputDir/beam_forces.out" -time -ele 1 force
+
+# 保存特征周期与网格信息
+set fp_period [open "$outputDir/structural_periods.txt" w]
+puts $fp_period "# 结构特征周期计算结果 (numEle = $numEle)"
+puts $fp_period "分析时间 = [clock format [clock seconds]]"
+puts $fp_period "单元数量 numEle = $numEle"
+puts $fp_period "水平向特征周期 T_h = [format %.6f $T_horizontal] s"
+puts $fp_period "竖直向特征周期 T_v = [format %.6f $T_vertical] s"
+puts $fp_period "Rayleigh阻尼系数 alphaM = [format %.4e $alphaM], betaK = [format %.4e $betaK]"
+close $fp_period
+
+# ====================================================
+# 12. 时程分析
+# ====================================================
+puts "\n========== 时程分析 =========="
+set gamma 0.6
+set beta 0.3025
+constraints Transformation
+numberer RCM
+system SparseGeneral
+test EnergyIncr $tolerance $maxIterations 0
+algorithm KrylovNewton
+integrator Newmark $gamma $beta
+analysis Transient
+
+set step 0
+set successfulSteps 0
+set failedSteps 0
+set startTime [clock seconds]
+
+while {$step < $nPoints} {
+    incr step
+    set ok [analyze 1 $dt]
+    if {$ok == 0} {
+        incr successfulSteps
+    } else {
+        incr failedSteps
+        # 减半步长重试一次
+        set dt_half [expr {$dt / 2.0}]
+        set ok2 [analyze 2 $dt_half]
+        if {$ok2 == 0} {
+            incr successfulSteps
+            incr step
+        } else {
+            puts "警告：步 $step 失败，跳过"
+        }
+    }
+    # 进度输出
+    if {$step % $printInterval == 0} {
+        puts "  进度: $step / $nPoints, 成功=$successfulSteps, 失败=$failedSteps"
+    }
+    # 超时保护（30分钟）
+    if {[expr {[clock seconds] - $startTime}] > 1800} {
+        puts "分析超时（30分钟），提前终止"
+        break
+    }
+}
+
+# ====================================================
+# 13. 结果汇总
+# ====================================================
+puts "\n========== 分析完成 =========="
+puts "总步数: $step"
+puts "成功步数: $successfulSteps"
+puts "失败步数: $failedSteps"
+if {$step > 0} {
+    puts "成功率: [format %.2f [expr {100.0*$successfulSteps/$step}]]%"
+}
+
+set ux_final [nodeDisp $topNode 1]
+set uy_final [nodeDisp $topNode 2]
+set uz_final [nodeDisp $topNode 3]
+puts "\n最终位移（顶部）: X=[format %.6e $ux_final] m, Y=[format %.6e $uy_final] m, Z=[format %.6e $uz_final] m"
+
+set beamForces [eleResponse 1 force]
+if {[llength $beamForces] >= 6} {
+    puts "\n基底内力: Vx=[format %.2f [lindex $beamForces 0]] N, Vy=[format %.2f [lindex $beamForces 1]] N, Nz=[format %.2f [lindex $beamForces 2]] N"
+}
+
+puts "\n模型分析结束。输出已写入 $outputDir/"
