@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees EDP 后处理 (最终论文版 v2)
-- 严格符合论文定义
-- 支持网格收敛 (outputs_mesh_*)
-- 质量分配与 Tcl 一致 (有效质量 = 0.95*总物理质量)
-- D_w_peak 使用各节点绝对功率之和 (而非整体绝对值)
-- 包含节点峰值检查，自动验证顶部节点是否为最大响应
+OpenSees EDP 后处理 (最终论文版 v3)
+- 严格匹配 Tcl 质量分配：包含顶部附加质量 M_ADD = 3000 kg
+- 修正质量缺失问题，恢复正确位移与能量量级
+- 其余 EDP 定义与论文完全一致
+- 支持网格收敛分析 (outputs_mesh_*)
 """
 
 import os
@@ -18,8 +17,9 @@ import pandas as pd
 # ============================================================
 # 用户可调参数
 # ============================================================
-ACCEL_IN_G = False          # 文件已为 m/s²
+ACCEL_IN_G = False          # 文件已为 m/s²，不做缩放
 EPS = 1.0e-12
+M_ADD = 3000.0              # ★★★ 顶部附加质量 (kg)，必须与 Tcl 中的 M_add 一致 ★★★
 
 # 结构几何与材料（用于计算梁总质量）
 D = 0.35
@@ -27,7 +27,7 @@ t_wall = 0.035
 L = 4.5
 rho = 2700.0
 A_cross = np.pi * ((D/2)**2 - (D/2 - t_wall)**2)
-BEAM_MASS = rho * A_cross * L          # 物理总质量 (kg)
+BEAM_MASS = rho * A_cross * L          # 杆总质量 (kg)
 
 # 固定地震波文件名（与 Tcl 一致）
 ACCEL_FILES = {
@@ -68,18 +68,18 @@ def read_accel_file(fpath, dt_ref=0.01):
         accel = accel * G_CONST
     return t, accel
 
-def get_node_masses(n_mass_nodes, beam_mass):
+def get_node_masses(n_mass_nodes, beam_mass, add_mass):
     """
     严格匹配 Tcl 质量分配：
     - 内部节点 (n-1) 个：质量 = beam_mass / n
-    - 顶部节点 (最后一个)：质量 = 0.5 * beam_mass / n
-    有效质量 = (n - 0.5) * beam_mass / n
+    - 顶部节点 (最后一个)：质量 = add_mass + 0.5 * beam_mass / n
+    实际总质量 = add_mass + (n - 0.5) * beam_mass / n
     """
     if n_mass_nodes <= 1:
-        return np.array([beam_mass])
+        return np.array([add_mass + beam_mass])
     m_internal = beam_mass / n_mass_nodes
     masses = np.full(n_mass_nodes, m_internal)
-    masses[-1] = 0.5 * m_internal
+    masses[-1] = add_mass + 0.5 * m_internal
     return masses
 
 # ============================================================
@@ -107,9 +107,10 @@ def compute_edps(folder_path, case_id):
     except:
         pass
 
-    # 质量分配
-    masses = get_node_masses(nnodes, BEAM_MASS)
-    effective_mass = np.sum(masses)          # 实际参与动力质量 (0.95*BEAM_MASS)
+    # ★★★ 质量分配（包含顶部附加质量）★★★
+    masses = get_node_masses(nnodes, BEAM_MASS, M_ADD)
+    total_mass = np.sum(masses)          # 实际动力质量 = M_ADD + (nnodes-0.5)*BEAM_MASS/nnodes
+    print(f"   节点质量总和 = {total_mass:.2f} kg (梁 {BEAM_MASS:.2f} + 附加 {M_ADD:.2f})")
 
     # 读取地震波并插值
     t_x, ax = read_accel_file(ACCEL_FILES['X'], dt)
@@ -162,7 +163,7 @@ def compute_edps(folder_path, case_id):
     idx_95 = np.searchsorted(cum_weight_norm, 0.95)
     if idx_5 == idx_95:
         idx_5, idx_95 = 0, len(t) - 1
-    D_w_peak = np.max(disp_3d_top[idx_5:idx_95+1])   # 顶部节点在此窗口内的峰值
+    D_w_peak = np.max(disp_3d_top[idx_5:idx_95+1])
     t5, t95 = t[idx_5], t[idx_95]
 
     # ----- EDP 4: D_3D_max (顶部节点三维峰值位移) -----
@@ -208,8 +209,9 @@ def compute_edps(folder_path, case_id):
         "t@maxUz (s)": t_max_uz,
         "max|Uz| (m)": max_uz,
         "max|Uh| (m)": max_h,
-        "有效质量 (kg)": effective_mass,
-        "物理总质量 (kg)": BEAM_MASS,
+        "总质量(动力) (kg)": total_mass,
+        "梁质量 (kg)": BEAM_MASS,
+        "附加质量 (kg)": M_ADD,
         "步长 dt (s)": dt,
     }
 
@@ -235,7 +237,7 @@ def extract_case_id(folder_name):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  OpenSees EDP 后处理 (最终论文版 v2)")
+    print("  OpenSees EDP 后处理 (最终论文版 v3 - 修正质量)")
     print("=" * 70)
 
     folders = find_folders()
@@ -270,23 +272,23 @@ if __name__ == "__main__":
         sys.exit(1)
 
     df = pd.DataFrame(results)
-    csv_path = "mesh_convergence_EDP_final_v2.csv"
+    csv_path = "mesh_convergence_EDP_final_v3.csv"
     df.to_csv(csv_path, index=False, float_format="%.6e")
 
-    txt_path = "mesh_convergence_EDP_final_v2.txt"
+    txt_path = "mesh_convergence_EDP_final_v3.txt"
     with open(txt_path, "w") as f:
-        f.write("Mesh Convergence EDP Results (Final v2, consistent with paper)\n")
+        f.write("Mesh Convergence EDP Results (Final v3, corrected mass with M_ADD=3000 kg)\n")
         f.write("=" * 70 + "\n")
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
         f.write("【计算说明】\n")
         f.write("1. 地震波为 m/s²，不缩放 (ACCEL_IN_G=False)\n")
-        f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点为内部的一半\n")
+        f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点 M_ADD + 0.5*beam_mass/numEle\n")
         f.write("3. E_in 为梯形累积输入能量绝对值最大值（分布质量）\n")
         f.write("4. D_w_peak 窗口基于各节点绝对功率之和（5%-95% 闭区间）\n")
         f.write("5. R_VH 采用质量加权速度平方积分（动能比）\n")
         f.write("6. 顶部节点取最后一个质量节点（索引 -1）\n")
-        f.write("7. 有效质量 = (numEle-0.5)*beam_mass/numEle，即 0.95*物理总质量\n")
+        f.write(f"7. 顶部附加质量 M_ADD = {M_ADD} kg\n")
 
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
