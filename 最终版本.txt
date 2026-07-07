@@ -1,7 +1,7 @@
 # ====================================================
-# model_fixed_numEle10.tcl
+# model_fixed_numEle10_stable.tcl
 # 竖直悬臂杆 - 三向月震输入，固定网格 numEle=10
-# 基于原模型优化，提升数值稳定性
+# 基于原始稳定模型，仅做必要修改（算法、阻尼、模态阶数）
 # ====================================================
 
 wipe
@@ -116,7 +116,7 @@ for {set i 1} {$i <= $topNode} {incr i} {
 }
 fix 1 1 1 1 1 1
 
-# 集中质量分配
+# 集中质量分配（与原始模型完全一致）
 for {set i 2} {$i < $topNode} {incr i} {
     mass $i $mEle $mEle $mEle 0 0 0
 }
@@ -131,7 +131,7 @@ for {set i 1} {$i <= $numEle} {incr i} {
 }
 
 # ====================================================
-# 7. 重力分析（单步，使用 SparseGeneral）
+# 7. 重力分析（单步，使用 BandGeneral 与原始一致）
 # ====================================================
 pattern Plain 10 Linear {
     for {set i 2} {$i < $topNode} {incr i} {
@@ -142,10 +142,10 @@ pattern Plain 10 Linear {
 
 constraints Transformation
 numberer RCM
-system SparseGeneral          ;# 更稳健
+system BandGeneral                ;# 与原始一致
 test NormDispIncr $tolerance $maxIterations 0
 algorithm Newton
-integrator LoadControl 1.0    ;# 单步加载
+integrator LoadControl 1.0        ;# 单步加载（更高效，也可改为0.1分10步）
 analysis Static
 set okGravity [analyze 1]
 
@@ -156,10 +156,10 @@ if {$okGravity != 0} {
 wipeAnalysis
 
 # ====================================================
-# 8. 模态分析与特征周期识别
+# 8. 模态分析（仅取前2阶，用于Rayleigh阻尼）
 # ====================================================
-set numModes 3
-set eigenValues [eigen -fullGenLapack $numModes]   ;# 指定稳健求解器
+set numModes 2
+set eigenValues [eigen -fullGenLapack $numModes]   ;# 使用稳健求解器
 
 set omega1 0.0
 set omega2 0.0
@@ -178,7 +178,7 @@ for {set i 0} {$i < $numModes} {incr i} {
     }
 }
 
-# 特征周期识别（基于振型分量比例）
+# 特征周期识别（基于振型分量比例，保留原功能）
 puts "\n结构特征周期（振型方向识别）："
 for {set i 1} {$i <= $numModes} {incr i} {
     set lambda [lindex $eigenValues [expr {$i-1}]]
@@ -218,7 +218,7 @@ if {$T_horizontal == 0.0} { set T_horizontal [expr {2.0 * $pi * sqrt($m / $k_ben
 if {$T_vertical == 0.0}   { set T_vertical   [expr {2.0 * $pi * sqrt($m / $k_axial)}] }
 
 # ====================================================
-# 9. Rayleigh 阻尼
+# 9. Rayleigh 阻尼（修正参数顺序）
 # ====================================================
 if {$omega1 > 0 && $omega2 > 0} {
     set alphaM [expr {2.0 * $zeta * $omega1 * $omega2 / ($omega1 + $omega2)}]
@@ -230,7 +230,8 @@ if {$omega1 > 0 && $omega2 > 0} {
     set alphaM 0.0
     set betaK  0.0
 }
-rayleigh $alphaM 0.0 $betaK 0.0
+# ★ 关键修改：rayleigh 格式为 alphaM, betaK_current, betaK_initial, betaK_comm
+rayleigh $alphaM 0.0 0.0 $betaK
 
 # ====================================================
 # 10. 地震输入
@@ -244,7 +245,7 @@ timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor $factorZ
 pattern UniformExcitation 3 3 -accel 3
 
 # ====================================================
-# 11. 输出记录器（所有节点）
+# 11. 输出记录器（所有质量节点，便于后处理）
 # ====================================================
 set outputDir "outputs_mesh_${numEle}"
 file mkdir $outputDir
@@ -265,16 +266,16 @@ puts $fp_period "Rayleigh阻尼系数 alphaM = [format %.4e $alphaM], betaK = [f
 close $fp_period
 
 # ====================================================
-# 12. 时程分析
+# 12. 时程分析（算法改回 Newton，求解器 BandGeneral）
 # ====================================================
 puts "\n========== 时程分析 =========="
 set gamma 0.6
 set beta 0.3025
 constraints Transformation
 numberer RCM
-system SparseGeneral
+system BandGeneral                ;# 与原始一致
 test EnergyIncr $tolerance $maxIterations 0
-algorithm KrylovNewton
+algorithm Newton                  ;# ★ 改为 Newton（更稳健）
 integrator Newmark $gamma $beta
 analysis Transient
 
