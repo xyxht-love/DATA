@@ -313,7 +313,7 @@ pattern UniformExcitation 1 1 -accel 1
 timeSeries Path 2 -dt $dt -filePath $fileY -column 2 -factor $factorY
 pattern UniformExcitation 2 2 -accel 2
 
-timeSeries Path 3 -dt $dt -filePath $fileZ -column 2 -factor $factorZ
+timeSeries Path 3 -dt $dt -filePath $fileZ -column 1 -factor $factorZ
 pattern UniformExcitation 3 3 -accel 3
 
 puts "Ground motions loaded."
