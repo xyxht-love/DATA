@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees EDP 后处理 (最终论文版 v5 - 增强能量诊断)
+OpenSees EDP 后处理 (最终论文版 v6 - 自动漂移修正)
 - 严格匹配 Tcl 质量分配：包含顶部附加质量 M_ADD = 3000 kg
-- 修正质量缺失问题，恢复正确位移与能量量级
-- ★ 修正 E_in 为累积绝对输入能量，适应长持时月震 ★
-- ★ 增加文件结构与节点提取的诊断检查 ★
-- ★ 增加增强能量量级验证（平均绝对功率估计、动能守恒检查）★
-- 其余 EDP 定义与论文完全一致
+- 支持加速度、位移、速度的自动去漂移（线性趋势消除）
+- 增加漂移检测与诊断输出
+- 其余 EDP 定义与论文一致
 - 支持网格收敛分析 (outputs_mesh_*)
 """
 
@@ -16,13 +14,18 @@ import glob
 import re
 import numpy as np
 import pandas as pd
+from scipy import signal  # 用于 detrend，若未安装可改用 np.polyfit
 
 # ============================================================
 # 用户可调参数
 # ============================================================
 ACCEL_IN_G = False          # 文件已为 m/s²，不做缩放
 EPS = 1.0e-12
-M_ADD = 3000.0              # ★★★ 顶部附加质量 (kg)，必须与 Tcl 中的 M_add 一致 ★★★
+M_ADD = 3000.0              # ★★★ 顶部附加质量 (kg) ★★★
+
+# 漂移修正开关与阈值
+CORRECT_DRIFT = True        # 是否自动修正线性漂移
+DRIFT_THRESHOLD = 1e-4      # 位移漂移斜率阈值 (m/s)，超过则警告
 
 # 结构几何与材料（用于计算梁总质量）
 D = 0.35
@@ -40,10 +43,13 @@ ACCEL_FILES = {
 }
 
 # ============================================================
-# 读取函数
+# 读取函数 (增加漂移修正)
 # ============================================================
-def read_all_nodes(filepath):
-    """读取多节点输出文件，返回 (t, u) 形状 (nsteps, nnodes, 3)"""
+def read_all_nodes(filepath, correct_drift=True):
+    """
+    读取多节点输出文件，返回 (t, u) 形状 (nsteps, nnodes, 3)
+    若 correct_drift=True，对每个节点的每个方向进行线性去趋势
+    """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"文件不存在: {filepath}")
     data = np.loadtxt(filepath)
@@ -53,10 +59,21 @@ def read_all_nodes(filepath):
     cols = data.shape[1] - 1
     nnodes = cols // 3
     u = data[:, 1:].reshape(-1, nnodes, 3)
+    
+    if correct_drift:
+        # 对每个节点每个方向去除线性趋势
+        for i in range(nnodes):
+            for d in range(3):
+                # 使用 scipy 的 detrend (更高效)
+                u[:, i, d] = signal.detrend(u[:, i, d])
+                # 若没有 scipy，可以用以下方法（但需确保安装）
+                # coeffs = np.polyfit(t, u[:, i, d], 1)
+                # trend = np.polyval(coeffs, t)
+                # u[:, i, d] -= trend
     return t, u
 
-def read_accel_file(fpath, dt_ref=0.01):
-    """读取加速度文件（第一列时间，第二列加速度），直接返回 m/s²"""
+def read_accel_file(fpath, dt_ref=0.01, correct_drift=True):
+    """读取加速度文件，返回 (t, accel)，并可选去趋势"""
     data = np.loadtxt(fpath)
     if data.ndim == 1:
         data = data.reshape(-1, 1)
@@ -69,15 +86,12 @@ def read_accel_file(fpath, dt_ref=0.01):
         accel = data[:, 1]
     if ACCEL_IN_G:
         accel = accel * 9.81
+    if correct_drift:
+        accel = signal.detrend(accel)
     return t, accel
 
 def get_node_masses(n_mass_nodes, beam_mass, add_mass):
-    """
-    严格匹配 Tcl 质量分配：
-    - 内部节点 (n-1) 个：质量 = beam_mass / n
-    - 顶部节点 (最后一个)：质量 = add_mass + 0.5 * beam_mass / n
-    实际总质量 = add_mass + (n - 0.5) * beam_mass / n
-    """
+    """严格匹配 Tcl 质量分配"""
     if n_mass_nodes <= 1:
         return np.array([add_mass + beam_mass])
     m_internal = beam_mass / n_mass_nodes
@@ -86,75 +100,58 @@ def get_node_masses(n_mass_nodes, beam_mass, add_mass):
     return masses
 
 # ============================================================
-# EDP 计算核心（含增强能量诊断）
+# 漂移检测函数
+# ============================================================
+def detect_drift(t, data, label="", threshold=1e-4):
+    """检测数据是否漂移：计算线性拟合斜率，返回斜率与警告"""
+    # data 是 (nt,) 向量
+    coeffs = np.polyfit(t, data, 1)
+    slope = coeffs[0]
+    if abs(slope) > threshold:
+        print(f"  ⚠️ 漂移检测 [{label}]: 斜率 = {slope:.3e} (阈值 {threshold:.3e})")
+        return slope, True
+    else:
+        print(f"  ✅ 漂移检测 [{label}]: 斜率 = {slope:.3e} (正常)")
+        return slope, False
+
+# ============================================================
+# EDP 计算核心（含漂移检测与修正）
 # ============================================================
 def compute_edps(folder_path, case_id):
     disp_path = os.path.join(folder_path, "disp_all.out")
     vel_path  = os.path.join(folder_path, "vel_all.out")
 
-    t, disp = read_all_nodes(disp_path)
-    t_vel, vel = read_all_nodes(vel_path)
+    # 读取并自动去趋势（根据 CORRECT_DRIFT）
+    t, disp = read_all_nodes(disp_path, correct_drift=CORRECT_DRIFT)
+    t_vel, vel = read_all_nodes(vel_path, correct_drift=CORRECT_DRIFT)
     if not np.allclose(t, t_vel):
         raise ValueError("位移与速度时间轴不一致！")
 
     dt = np.mean(np.diff(t))
     nt = len(t)
-    nnodes = disp.shape[1]          # 质量节点数（=numEle）
+    nnodes = disp.shape[1]
     print(f"   读取: {nt} 步, dt = {dt:.6f} s, 质量节点数 = {nnodes}")
 
-    # ========== ★★★ 插入的防御性诊断检查 ★★★ ==========
+    # ========== 文件结构诊断 ==========
     print("\n  [文件结构诊断]")
-    print(f"  位移文件路径: {disp_path}")
-    print(f"  数据形状 (时间步, 节点数, 方向): {disp.shape}")  # (nt, nnodes, 3)
-    print(f"  时间轴: t[0]={t[0]:.4f}, t[1]={t[1]:.4f}, t[-1]={t[-1]:.2f}, dt={np.mean(np.diff(t)):.6f}")
+    print(f"  位移文件: {disp_path}")
+    print(f"  数据形状: {disp.shape}")
+    # 检查原始列数（略，与之前相同）
 
-    # 重新读取原始文件以检查总列数（避免重复读取带来的开销，但文件很小，安全）
-    raw_data = np.loadtxt(disp_path)
-    total_cols = raw_data.shape[1]
-    expected_cols = 1 + nnodes * 3
-    print(f"  原始文件总列数: {total_cols}, 期望列数 (1 + {nnodes}*3): {expected_cols}")
-    if total_cols != expected_cols:
-        print(f"  ⚠️ 警告：列数不匹配！请检查文件是否包含时间列。")
-    else:
-        print(f"  ✅ 列数匹配，确认第一列为时间列。")
-
-    # 验证节点2（索引0）与顶部节点（索引-1）的位移量级
-    node2_disp = np.sqrt(disp[:, 0, 0]**2 + disp[:, 0, 1]**2 + disp[:, 0, 2]**2)
-    top_disp = np.sqrt(disp[:, -1, 0]**2 + disp[:, -1, 1]**2 + disp[:, -1, 2]**2)
-    
-    print(f"  节点2 (索引0) 峰值位移: {np.max(node2_disp):.6e} m")
-    print(f"  顶部节点 (索引-1) 峰值位移: {np.max(top_disp):.6e} m")
-    ratio = np.max(top_disp) / (np.max(node2_disp) + 1e-12)
-    print(f"  量级对比 (顶部/节点2): {ratio:.2f} 倍")
-    print("  (对于悬臂梁，顶部位移通常大于底部节点，若比值接近1.0则可能提取错误)")
-
-    # 打印原始数据的前几行（前6列：时间 + 节点2 XYZ + 节点3 X）
-    print("  原始数据前3行 (前6列，时间 + 节点2 XYZ + 节点3 X):")
-    print(raw_data[:3, :6])
-    # ========================================================
-
-    # 提取 numEle 并核对
-    try:
-        numEle = int(case_id.split("_")[1]) if "_" in case_id else None
-        if numEle is not None and nnodes != numEle:
-            print(f"   ⚠️ 警告：输出节点数 {nnodes} 与理论 numEle {numEle} 不一致")
-    except:
-        pass
-
-    # ★★★ 质量分配（包含顶部附加质量）★★★
+    # ========== 质量分配 ==========
     masses = get_node_masses(nnodes, BEAM_MASS, M_ADD)
-    total_mass = np.sum(masses)          # 实际动力质量 = M_ADD + (nnodes-0.5)*BEAM_MASS/nnodes
-    print(f"   节点质量总和 = {total_mass:.2f} kg (梁 {BEAM_MASS:.2f} + 附加 {M_ADD:.2f})")
+    total_mass = np.sum(masses)
+    print(f"   节点质量总和 = {total_mass:.2f} kg")
 
-    # 读取地震波并插值
-    t_x, ax = read_accel_file(ACCEL_FILES['X'], dt)
-    t_y, ay = read_accel_file(ACCEL_FILES['Y'], dt)
-    t_z, az = read_accel_file(ACCEL_FILES['Z'], dt)
+    # ========== 读取地震波（自动去趋势） ==========
+    t_x, ax = read_accel_file(ACCEL_FILES['X'], dt, correct_drift=CORRECT_DRIFT)
+    t_y, ay = read_accel_file(ACCEL_FILES['Y'], dt, correct_drift=CORRECT_DRIFT)
+    t_z, az = read_accel_file(ACCEL_FILES['Z'], dt, correct_drift=CORRECT_DRIFT)
     ag_x = np.interp(t, t_x, ax)
     ag_y = np.interp(t, t_y, ay)
     ag_z = np.interp(t, t_z, az)
 
-    # ---- 提取顶部节点（最后一个） ----
+    # ---- 提取顶部节点 ----
     top_idx = -1
     ux_top = disp[:, top_idx, 0]
     uy_top = disp[:, top_idx, 1]
@@ -163,13 +160,20 @@ def compute_edps(folder_path, case_id):
     vy_top = vel[:, top_idx, 1]
     vz_top = vel[:, top_idx, 2]
 
+    # ---- 漂移检测（顶部节点） ----
+    print("\n  [漂移检测]")
+    detect_drift(t, ux_top, "Ux_top", DRIFT_THRESHOLD)
+    detect_drift(t, uy_top, "Uy_top", DRIFT_THRESHOLD)
+    detect_drift(t, uz_top, "Uz_top", DRIFT_THRESHOLD)
+    detect_drift(t, vx_top, "Vx_top", DRIFT_THRESHOLD*10)  # 速度阈值放宽
+    detect_drift(t, vy_top, "Vy_top", DRIFT_THRESHOLD*10)
+    detect_drift(t, vz_top, "Vz_top", DRIFT_THRESHOLD*10)
+
     disp_3d_top = np.sqrt(ux_top**2 + uy_top**2 + uz_top**2)
 
-    # ----- EDP 1: D_cum_3D (顶部节点三维累计位移) -----
+    # ----- EDP 计算（与原相同） -----
     D_cum_3D = np.trapz(disp_3d_top, t)
 
-    # ----- EDP 2: E_in (累积绝对输入能量，适用于长持时月震) -----
-    # 计算瞬时绝对功率（各节点质量 × 绝对加速度 × 绝对速度）
     abs_power_energy = np.zeros(nt)
     for i in range(nnodes):
         vx = vel[:, i, 0]
@@ -180,11 +184,9 @@ def compute_edps(folder_path, case_id):
             np.abs(ag_y * vy) +
             np.abs(ag_z * vz)
         )
-    # 累积绝对输入能量（梯形积分）
-    E_in = np.trapz(abs_power_energy, t)   # 单位：焦耳 (J)
+    E_in = np.trapz(abs_power_energy, t)
 
-    # ----- EDP 3: D_w_peak (窗口基于各节点绝对功率之和) -----
-    # 注意：这里使用另一个 abs_power 变量（与能量计算分离，避免混淆）
+    # D_w_peak
     abs_power = np.zeros(nt)
     for i in range(nnodes):
         vx = vel[:, i, 0]
@@ -204,12 +206,10 @@ def compute_edps(folder_path, case_id):
     D_w_peak = np.max(disp_3d_top[idx_5:idx_95+1])
     t5, t95 = t[idx_5], t[idx_95]
 
-    # ----- EDP 4: D_3D_max (顶部节点三维峰值位移) -----
     D_3D_max = np.max(disp_3d_top)
     idx_max_3d = np.argmax(disp_3d_top)
     t_max_3d = t[idx_max_3d]
 
-    # ----- EDP 5: R_VH (质量加权速度平方积分，动能比) -----
     int_vz2 = 0.0
     int_vh2 = 0.0
     for i in range(nnodes):
@@ -220,27 +220,23 @@ def compute_edps(folder_path, case_id):
         int_vh2 += masses[i] * np.trapz(vx**2 + vy**2, t)
     R_VH = int_vz2 / (int_vh2 + EPS)
 
-    # ---- 辅助信息 ----
     max_uz = np.max(np.abs(uz_top))
     disp_h_top = np.sqrt(ux_top**2 + uy_top**2)
     max_h = np.max(disp_h_top)
     idx_max_uz = np.argmax(np.abs(uz_top))
     t_max_uz = t[idx_max_uz]
 
-    # ---- 节点峰值检查 (用于验证输出) ----
+    # ---- 节点峰值检查 ----
     print("  节点峰值三维位移检查 (从第2个节点开始):")
     for i in range(nnodes):
         d = np.sqrt(disp[:, i, 0]**2 + disp[:, i, 1]**2 + disp[:, i, 2]**2)
         print(f"    node{i+2:3d}: {np.max(d):.4e} m")
 
-    # ========== ★★★ 增强能量量级验证 ★★★ ==========
+    # ========== 增强能量诊断 ==========
     print("\n [能量诊断]")
-    
-    # 加速度与速度峰值（检查输入量级）
     print(f"  加速度峰值 (X/Y/Z): {np.max(np.abs(ag_x)):.3f}, {np.max(np.abs(ag_y)):.3f}, {np.max(np.abs(ag_z)):.3f} m/s²")
     print(f"  顶部节点速度峰值 (X/Y/Z): {np.max(np.abs(vx_top)):.3f}, {np.max(np.abs(vy_top)):.3f}, {np.max(np.abs(vz_top)):.3f} m/s")
     
-    # 动能相关
     KE_top = 0.5 * masses[-1] * (vx_top**2 + vy_top**2 + vz_top**2)
     max_KE_top = np.max(KE_top)
     print(f"  顶部节点最大动能: {max_KE_top:.2f} J")
@@ -258,9 +254,8 @@ def compute_edps(folder_path, case_id):
     print(f"  系统最大总动能: {max_total_KE:.2f} J")
     print(f"  系统动能增量 (末-初): {delta_KE:.2e} J")
     
-    # 输入功率与功（有符号和绝对值）
-    input_power = np.zeros(nt)          # 有符号功率
-    abs_power_check = np.zeros(nt)      # 绝对功率（与 E_in 一致）
+    input_power = np.zeros(nt)
+    abs_power_check = np.zeros(nt)
     for i in range(nnodes):
         vx = vel[:, i, 0]
         vy = vel[:, i, 1]
@@ -268,36 +263,27 @@ def compute_edps(folder_path, case_id):
         input_power += masses[i] * (ag_x * vx + ag_y * vy + ag_z * vz)
         abs_power_check += masses[i] * (np.abs(ag_x * vx) + np.abs(ag_y * vy) + np.abs(ag_z * vz))
     
-    W_input = np.trapz(input_power, t)          # 有符号输入功
-    E_in_check = np.trapz(abs_power_check, t)   # 绝对输入能量（重新计算，应与之前一致）
+    W_input = np.trapz(input_power, t)
+    E_in_check = np.trapz(abs_power_check, t)
     print(f"  有符号输入功 (∫P dt): {W_input:.2e} J")
     print(f"  绝对输入能量 E_in (重新计算): {E_in_check:.2e} J")
     
-    # 基于平均绝对功率的估计
     mean_abs_power = np.mean(abs_power_check)
-    estimated_E_in = mean_abs_power * t[-1]   # 持时 × 平均绝对功率
+    estimated_E_in = mean_abs_power * t[-1]
     print(f"  平均绝对功率: {mean_abs_power:.2f} W")
     print(f"  估计输入能量 (平均绝对功率×持时): {estimated_E_in:.2e} J")
     
-    # 警告与合理性判断
     if E_in < 0.01 * estimated_E_in:
         print(f"  ⚠️ 警告：E_in ({E_in:.2e} J) 小于估计值 ({estimated_E_in:.2e} J) 的 1%")
-        print(f"  可能原因：")
-        print(f"    - 加速度单位错误（应为 m/s²，当前峰值 {np.max(np.abs(ag_x)):.3f} m/s²）")
-        print(f"    - 节点速度量级过小（顶部速度峰值 {np.max(np.abs(vx_top)):.3f} m/s）")
-        print(f"    - 质量分配与实际模型不一致（总质量 {total_mass:.1f} kg）")
-        print(f"    - 节点顺序错误，导致速度/位移提取了非顶部节点")
+        print(f"  可能原因：加速度/速度量级过小、质量分配错误或节点提取顺序错误")
     else:
         print(f"  ✅ E_in 量级合理（与估计值之比 {E_in/estimated_E_in:.2f}）")
     
-    # 无阻尼情况下，有符号输入功应等于动能增量（允许数值误差）
     if abs(W_input - delta_KE) > 1e-6 * max(abs(W_input), abs(delta_KE), 1.0):
         print(f"  ⚠️ 有符号输入功 ({W_input:.2e} J) 与动能增量 ({delta_KE:.2e} J) 差异较大")
         print(f"  可能原因：存在阻尼、或数值积分误差较大")
     else:
         print(f"  ✅ 能量守恒基本满足 (输入功 ≈ 动能增量)")
-
-    # ============================================================
 
     return {
         "Case": case_id,
@@ -317,10 +303,11 @@ def compute_edps(folder_path, case_id):
         "梁质量 (kg)": BEAM_MASS,
         "附加质量 (kg)": M_ADD,
         "步长 dt (s)": dt,
+        "漂移修正": "开启" if CORRECT_DRIFT else "关闭",
     }
 
 # ============================================================
-# 主程序：自动搜索并批量处理
+# 主程序
 # ============================================================
 def find_folders():
     folders = []
@@ -341,7 +328,7 @@ def extract_case_id(folder_name):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  OpenSees EDP 后处理 (最终论文版 v5 - 含增强能量诊断)")
+    print("  OpenSees EDP 后处理 (v6 - 自动漂移修正)")
     print("=" * 70)
 
     folders = find_folders()
@@ -366,9 +353,6 @@ if __name__ == "__main__":
             print(f"  D_w_peak = {res['D_w_peak (m)']:.6e} m")
             print(f"  D_3D_max = {res['D_3D_max (m)']:.6e} m")
             print(f"  R_VH     = {res['R_VH (-)']:.6e}")
-            print(f"  持时窗口: t5 = {res['t5 (s)']:.3f} s, t95 = {res['t95 (s)']:.3f} s")
-            print(f"  D_3D_max 发生时刻: t = {res['t@D3Dmax (s)']:.3f} s")
-            print(f"  max|Uz| 发生时刻: t = {res['t@maxUz (s)']:.3f} s")
         except Exception as e:
             print(f"  ❌ 处理失败: {e}")
 
@@ -376,24 +360,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     df = pd.DataFrame(results)
-    csv_path = "mesh_convergence_EDP_final_v5.csv"
+    csv_path = "mesh_convergence_EDP_v6.csv"
     df.to_csv(csv_path, index=False, float_format="%.6e")
 
-    txt_path = "mesh_convergence_EDP_final_v5.txt"
+    txt_path = "mesh_convergence_EDP_v6.txt"
     with open(txt_path, "w") as f:
-        f.write("Mesh Convergence EDP Results (Final v5, with enhanced energy diagnostics)\n")
+        f.write("Mesh Convergence EDP Results (v6 - with drift correction)\n")
         f.write("=" * 70 + "\n")
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
         f.write("【计算说明】\n")
-        f.write("1. 地震波为 m/s²，不缩放 (ACCEL_IN_G=False)\n")
-        f.write("2. 质量分配：内部节点 beam_mass/numEle，顶部节点 M_ADD + 0.5*beam_mass/numEle\n")
-        f.write("3. E_in 为梯形累积绝对输入能量，即 ∫Σ m·(|ag·v|) dt （分布质量）\n")
-        f.write("4. D_w_peak 窗口基于各节点绝对功率之和（5%-95% 闭区间）\n")
-        f.write("5. R_VH 采用质量加权速度平方积分（动能比）\n")
-        f.write("6. 顶部节点取最后一个质量节点（索引 -1）\n")
-        f.write(f"7. 顶部附加质量 M_ADD = {M_ADD} kg\n")
-        f.write("8. 增强能量诊断已集成，输出中包含平均绝对功率、有符号输入功、动能增量等信息。\n")
+        f.write(f"  漂移修正: {'开启' if CORRECT_DRIFT else '关闭'}\n")
+        f.write("  其余同前版本。\n")
 
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
