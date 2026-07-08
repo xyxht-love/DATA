@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-OpenSees EDP 后处理 (最终论文版 v5)
+OpenSees EDP 后处理 (最终论文版 v5 - 增强能量诊断)
 - 严格匹配 Tcl 质量分配：包含顶部附加质量 M_ADD = 3000 kg
 - 修正质量缺失问题，恢复正确位移与能量量级
 - ★ 修正 E_in 为累积绝对输入能量，适应长持时月震 ★
 - ★ 增加文件结构与节点提取的诊断检查 ★
+- ★ 增加增强能量量级验证（平均绝对功率估计、动能守恒检查）★
 - 其余 EDP 定义与论文完全一致
 - 支持网格收敛分析 (outputs_mesh_*)
 """
@@ -67,7 +68,7 @@ def read_accel_file(fpath, dt_ref=0.01):
         t = data[:, 0]
         accel = data[:, 1]
     if ACCEL_IN_G:
-        accel = accel * G_CONST
+        accel = accel * 9.81
     return t, accel
 
 def get_node_masses(n_mass_nodes, beam_mass, add_mass):
@@ -85,7 +86,7 @@ def get_node_masses(n_mass_nodes, beam_mass, add_mass):
     return masses
 
 # ============================================================
-# EDP 计算核心
+# EDP 计算核心（含增强能量诊断）
 # ============================================================
 def compute_edps(folder_path, case_id):
     disp_path = os.path.join(folder_path, "disp_all.out")
@@ -232,6 +233,72 @@ def compute_edps(folder_path, case_id):
         d = np.sqrt(disp[:, i, 0]**2 + disp[:, i, 1]**2 + disp[:, i, 2]**2)
         print(f"    node{i+2:3d}: {np.max(d):.4e} m")
 
+    # ========== ★★★ 增强能量量级验证 ★★★ ==========
+    print("\n [能量诊断]")
+    
+    # 加速度与速度峰值（检查输入量级）
+    print(f"  加速度峰值 (X/Y/Z): {np.max(np.abs(ag_x)):.3f}, {np.max(np.abs(ag_y)):.3f}, {np.max(np.abs(ag_z)):.3f} m/s²")
+    print(f"  顶部节点速度峰值 (X/Y/Z): {np.max(np.abs(vx_top)):.3f}, {np.max(np.abs(vy_top)):.3f}, {np.max(np.abs(vz_top)):.3f} m/s")
+    
+    # 动能相关
+    KE_top = 0.5 * masses[-1] * (vx_top**2 + vy_top**2 + vz_top**2)
+    max_KE_top = np.max(KE_top)
+    print(f"  顶部节点最大动能: {max_KE_top:.2f} J")
+    
+    total_KE = np.zeros(nt)
+    for i in range(nnodes):
+        vx = vel[:, i, 0]
+        vy = vel[:, i, 1]
+        vz = vel[:, i, 2]
+        total_KE += 0.5 * masses[i] * (vx**2 + vy**2 + vz**2)
+    max_total_KE = np.max(total_KE)
+    KE_initial = total_KE[0]
+    KE_final = total_KE[-1]
+    delta_KE = KE_final - KE_initial
+    print(f"  系统最大总动能: {max_total_KE:.2f} J")
+    print(f"  系统动能增量 (末-初): {delta_KE:.2e} J")
+    
+    # 输入功率与功（有符号和绝对值）
+    input_power = np.zeros(nt)          # 有符号功率
+    abs_power_check = np.zeros(nt)      # 绝对功率（与 E_in 一致）
+    for i in range(nnodes):
+        vx = vel[:, i, 0]
+        vy = vel[:, i, 1]
+        vz = vel[:, i, 2]
+        input_power += masses[i] * (ag_x * vx + ag_y * vy + ag_z * vz)
+        abs_power_check += masses[i] * (np.abs(ag_x * vx) + np.abs(ag_y * vy) + np.abs(ag_z * vz))
+    
+    W_input = np.trapz(input_power, t)          # 有符号输入功
+    E_in_check = np.trapz(abs_power_check, t)   # 绝对输入能量（重新计算，应与之前一致）
+    print(f"  有符号输入功 (∫P dt): {W_input:.2e} J")
+    print(f"  绝对输入能量 E_in (重新计算): {E_in_check:.2e} J")
+    
+    # 基于平均绝对功率的估计
+    mean_abs_power = np.mean(abs_power_check)
+    estimated_E_in = mean_abs_power * t[-1]   # 持时 × 平均绝对功率
+    print(f"  平均绝对功率: {mean_abs_power:.2f} W")
+    print(f"  估计输入能量 (平均绝对功率×持时): {estimated_E_in:.2e} J")
+    
+    # 警告与合理性判断
+    if E_in < 0.01 * estimated_E_in:
+        print(f"  ⚠️ 警告：E_in ({E_in:.2e} J) 小于估计值 ({estimated_E_in:.2e} J) 的 1%")
+        print(f"  可能原因：")
+        print(f"    - 加速度单位错误（应为 m/s²，当前峰值 {np.max(np.abs(ag_x)):.3f} m/s²）")
+        print(f"    - 节点速度量级过小（顶部速度峰值 {np.max(np.abs(vx_top)):.3f} m/s）")
+        print(f"    - 质量分配与实际模型不一致（总质量 {total_mass:.1f} kg）")
+        print(f"    - 节点顺序错误，导致速度/位移提取了非顶部节点")
+    else:
+        print(f"  ✅ E_in 量级合理（与估计值之比 {E_in/estimated_E_in:.2f}）")
+    
+    # 无阻尼情况下，有符号输入功应等于动能增量（允许数值误差）
+    if abs(W_input - delta_KE) > 1e-6 * max(abs(W_input), abs(delta_KE), 1.0):
+        print(f"  ⚠️ 有符号输入功 ({W_input:.2e} J) 与动能增量 ({delta_KE:.2e} J) 差异较大")
+        print(f"  可能原因：存在阻尼、或数值积分误差较大")
+    else:
+        print(f"  ✅ 能量守恒基本满足 (输入功 ≈ 动能增量)")
+
+    # ============================================================
+
     return {
         "Case": case_id,
         "Folder": os.path.basename(folder_path),
@@ -274,7 +341,7 @@ def extract_case_id(folder_name):
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  OpenSees EDP 后处理 (最终论文版 v5 - 含诊断检查)")
+    print("  OpenSees EDP 后处理 (最终论文版 v5 - 含增强能量诊断)")
     print("=" * 70)
 
     folders = find_folders()
@@ -314,7 +381,7 @@ if __name__ == "__main__":
 
     txt_path = "mesh_convergence_EDP_final_v5.txt"
     with open(txt_path, "w") as f:
-        f.write("Mesh Convergence EDP Results (Final v5, with diagnostic checks)\n")
+        f.write("Mesh Convergence EDP Results (Final v5, with enhanced energy diagnostics)\n")
         f.write("=" * 70 + "\n")
         f.write(df.to_string(index=False))
         f.write("\n" + "=" * 70 + "\n")
@@ -326,6 +393,7 @@ if __name__ == "__main__":
         f.write("5. R_VH 采用质量加权速度平方积分（动能比）\n")
         f.write("6. 顶部节点取最后一个质量节点（索引 -1）\n")
         f.write(f"7. 顶部附加质量 M_ADD = {M_ADD} kg\n")
+        f.write("8. 增强能量诊断已集成，输出中包含平均绝对功率、有符号输入功、动能增量等信息。\n")
 
     print(f"\n✅ 结果已保存至:")
     print(f"   - {csv_path}")
