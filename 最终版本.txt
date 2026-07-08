@@ -450,6 +450,26 @@ if {[llength $beamForce] >= 6} {
     puts "Mz = [format %.3f [lindex $beamForce 5]] N·m"
 }
 
+# ====================================================
+# 验证部分（分析结束后的内部状态）
+# ====================================================
+puts ""
+puts "========== 验证 =========="
+puts "Current time = [getTime]"
+
+# 记录最终位移到单独文件（与 nodeDisp 一致）
+set fp [open "lastNode.out" w]
+puts $fp "[getTime] $ux $uy $uz"
+close $fp
+puts "Final displacement written to lastNode.out"
+
+# 若需要强制 recorder 也输出，可定义 recorder 并 record，但此处直接用 nodeDisp 已足够
+# 可选：定义 recorder 并 record 以验证相同数据（如果希望使用 recorder 方式）
+recorder Node -file "lastNode_recorder.out" -node $topNode -dof 1 2 3 disp
+record
+
+puts "Verification finished."
+
 puts ""
 puts "Output directory : $outputDir"
 puts "Model finished."
