@@ -185,6 +185,11 @@ if {$okGravity!=0} {
 }
 puts ""
 puts "Gravity analysis finished."
+
+# ====== 修正：将重力荷载冻结为恒载 ======
+loadConst -time 0
+
+# 清除分析设置，但荷载模式保留
 wipeAnalysis
 
 # ====================================================
@@ -300,7 +305,7 @@ puts "==============================="
 puts "Dynamic Excitation"
 puts "==============================="
 
-remove loadPattern 10
+# ====== 修正：删除 remove loadPattern 10，保留重力 ======
 
 timeSeries Path 1 -dt $dt -filePath $fileX -column 2 -factor $factorX
 pattern UniformExcitation 1 1 -accel 1
@@ -355,8 +360,6 @@ set fp [open "$outputDir/structural_periods.txt" w]
 puts $fp "T_h = $T_horizontal"
 puts $fp "T_v = $T_vertical"
 close $fp
-
-# (可选) 也可保留详细的周期信息，但 Python 只读取上述两行
 
 puts ""
 puts "Output folder : $outputDir"
